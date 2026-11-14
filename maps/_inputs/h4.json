@@ -20,7 +20,7 @@
    "off": 8,
    "mask": 8796093022208,
    "press": false,
-   "how": "decoded live 2026-10-29 01:28 (key f, the grenade bind in use, as in Reach): +0x08 bit 43 and +0x30 bit 33 while held; F pressed again threw the last grenade (HUD count 1 -> 0, live)"
+   "how": "decoded live 2026-10-29 01:28 (key f, the owner's grenade bind as in Reach): +0x08 bit 43 and +0x30 bit 33 while held; F pressed again threw the last grenade (HUD count 1 -> 0, live)"
   },
   {
    "off": 48,
@@ -48,7 +48,7 @@
    "off": 8,
    "mask": 256,
    "press": false,
-   "how": "decoded live 2026-10-29 04:25 (tools/decode_buttons.py equipment=c, Regicide on Complex with every player's ability set to Jet Pack): +0x08 0x100 and +0x40 0xC0C0 while held. C is the armor ability bind in use: held 1.5 s it lifted the local player 1.58 u and turned the ability read on (Shift, Q, F, E, V, X, G, Z, Alt did not). Bots: botcore pressing it lifted every bot on foot 1.66-1.98 u with the ability read on, 4 of 4 (the 3 seated in a Mongoose or Ghost did not, as in the game; logs/tmp/h4_press_test.py)"
+   "how": "decoded live 2026-10-29 04:25 (tools/decode_buttons.py equipment=c, Regicide on Complex with every player's ability set to Jet Pack): +0x08 0x100 and +0x40 0xC0C0 while held. C is the owner's armor ability bind: held 1.5 s it lifted their player 1.58 u and turned the ability read on (Shift, Q, F, E, V, X, G, Z, Alt did not). Bots: botcore pressing it lifted every bot on foot 1.66-1.98 u with the ability read on, 4 of 4 (the 3 seated in a Mongoose or Ghost did not, as in the game; logs/tmp/h4_press_test.py)"
   },
   {
    "off": 64,
@@ -62,7 +62,7 @@
    "off": 8,
    "mask": 256,
    "press": false,
-   "how": "the equipment entry's own bits (both held), so a hold-mode kind that sends the ability button alone (brain/equipment.py hold_bit, tools/live_bots.py buttons) gets what lifted bots live on Oct 29: decoded live 2026-10-29 04:25 (tools/decode_buttons.py equipment=c, Regicide on Complex with every player's ability set to Jet Pack): +0x08 0x100 and +0x40 0xC0C0 while held. C is the armor ability bind in use: held 1.5 s it lifted the local player 1.58 u and turned the ability read on (Shift, Q, F, E, V, X, G, Z, Alt did not). Bots: botcore pressing it lifted every bot on foot 1.66-1.98 u with the ability read on, 4 of 4 (the 3 seated in a Mongoose or Ghost did not, as in the game; logs/tmp/h4_press_test.py)"
+   "how": "the equipment entry's own bits (both held), so a hold-mode kind that sends the ability button alone (brain/equipment.py hold_bit, tools/live_bots.py buttons) gets what lifted bots live on Oct 29: decoded live 2026-10-29 04:25 (tools/decode_buttons.py equipment=c, Regicide on Complex with every player's ability set to Jet Pack): +0x08 0x100 and +0x40 0xC0C0 while held. C is the owner's armor ability bind: held 1.5 s it lifted their player 1.58 u and turned the ability read on (Shift, Q, F, E, V, X, G, Z, Alt did not). Bots: botcore pressing it lifted every bot on foot 1.66-1.98 u with the ability read on, 4 of 4 (the 3 seated in a Mongoose or Ghost did not, as in the game; logs/tmp/h4_press_test.py)"
   },
   {
    "off": 64,
@@ -71,20 +71,20 @@
    "how": "the equipment entry's own bits (both held), so a hold-mode kind that sends the ability button alone (brain/equipment.py hold_bit, tools/live_bots.py buttons) gets what lifted bots live on Oct 29: decoded live 2026-10-29 04:25 (equipment=c): +0x40 0xC0C0 while held"
   }
  ],
- "fire2": [
-  {
-   "off": 8,
-   "mask": 292058365952,
-   "press": false,
-   "how": "from a player's recorded play, Nov 7 (Ragnarok 20261107-130445): right mouse held in the Mantis (8 holds, its rockets) and in the Banshee (10 holds; not its bomb: that is cycled to, the cycle entry) set +0x08 0x90000 and +0x0C 0x44 the whole hold, with the trigger float +0x3C 1.0 (native/h4f.cpp f_fill writes it); the rockets come out by the hold's length, a magazine's worth at most"
-  }
- ],
  "cycle": [
   {
    "off": 64,
-   "mask": 1024,
+   "mask": 4,
    "press": false,
-   "how": "from a player's recorded play, Nov 7 (Ragnarok 20261107-130445): the weapon switch (key 1) held set +0x40 0x400 in every press, 20 in the Banshee (its bomb: cycled to, fired with the main trigger, cycled back) and 15 on foot"
+   "how": "+0x40 bit 2, the one-second hold level: decoded from the owner's own input log, Nov 10 2026 (logs/owner_input_*.jsonl): during a real E hold at a Dominion terminal +0x40 goes 0x400000, then 0xC00000 at 0.3 s, then 0xC00004 at 1 s and 0xC0000C at 2 s; the capture finished at about 2.4 s. Used by brain/dom_base.py only while a bot holds a base; this button name is otherwise unused in Halo 4"
+  }
+ ],
+ "fire2": [
+  {
+   "off": 64,
+   "mask": 8,
+   "press": false,
+   "how": "+0x40 bit 3, the two-second hold level: decoded from the owner's own input log, Nov 10 2026 (logs/owner_input_*.jsonl): during a real E hold at a Dominion terminal +0x40 goes 0x400000, then 0xC00000 at 0.3 s, then 0xC00004 at 1 s and 0xC0000C at 2 s; the capture finished at about 2.4 s. Used by brain/dom_base.py only while a bot holds a base; this button name is otherwise unused in Halo 4"
   }
  ]
 }
