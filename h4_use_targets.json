@@ -1,0 +1,34 @@
+{
+ "_how": "Halo 4 Dominion terminals' object handles by map, read off the owner's input block while he aimed at each terminal (logs/owner_input_*.jsonl, Nov 10 2026: +0x6C of the action while +0x64 was 7; the same handles in two matches). pos = the Dom_base label's place (the trace's dominion order point). Used by brain/dom_base.py use_target -> botctl.set_use_target -> native h4f.cpp f_use_target. Another map: aim at each terminal once with the log on and add its handle here.",
+ "h4_ca_gore_valley": {
+  "bases": [
+   {
+    "name": "A",
+    "pos": [
+     -19.5,
+     -0.3,
+     -3.6
+    ],
+    "handle": "0xE55E02EF"
+   },
+   {
+    "name": "B",
+    "pos": [
+     15.4,
+     18.9,
+     0.4
+    ],
+    "handle": "0xE55F02F0"
+   },
+   {
+    "name": "C",
+    "pos": [
+     -21.5,
+     36.9,
+     -3.5
+    ],
+    "handle": "0xE56002F1"
+   }
+  ]
+ }
+}

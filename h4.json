@@ -1,0 +1,90 @@
+{
+ "action": [
+  {
+   "off": 64,
+   "mask": 12582912,
+   "press": false,
+   "how": "decoded live 2026-10-29 01:28 (tools/decode_buttons.py action=e, Adrift CTF): +0x40 0xC00000 while held (botcore's own Use sets only 0x400000, H2A's bit: Halo 4's runners stood on the flag and never took it, live the same night)"
+  }
+ ],
+ "melee": [
+  {
+   "off": 8,
+   "mask": 4096,
+   "press": false,
+   "how": "decoded live 2026-10-29 01:28 (melee=q): +0x08 0x1000 while held (Reach's melee is +0x08 too)"
+  }
+ ],
+ "grenade": [
+  {
+   "off": 8,
+   "mask": 8796093022208,
+   "press": false,
+   "how": "decoded live 2026-10-29 01:28 (key f, the owner's grenade bind as in Reach): +0x08 bit 43 and +0x30 bit 33 while held; F pressed again threw the last grenade (HUD count 1 -> 0, live)"
+  },
+  {
+   "off": 48,
+   "mask": 8589934592,
+   "press": false,
+   "how": "decoded live 2026-10-29 01:28 (key f): the throw's second bit, +0x30 bit 33"
+  }
+ ],
+ "reload": [
+  {
+   "off": 64,
+   "mask": 786432,
+   "press": false,
+   "how": "decoded live 2026-10-29 01:28 (reload=r): +0x40 0xC0000 and +0x30 bit 32 while held"
+  },
+  {
+   "off": 48,
+   "mask": 4294967296,
+   "press": false,
+   "how": "decoded live 2026-10-29 01:28 (reload=r): +0x30 bit 32"
+  }
+ ],
+ "equipment": [
+  {
+   "off": 8,
+   "mask": 256,
+   "press": false,
+   "how": "decoded live 2026-10-29 04:25 (tools/decode_buttons.py equipment=c, Regicide on Complex with every player's ability set to Jet Pack): +0x08 0x100 and +0x40 0xC0C0 while held. C is the owner's armor ability bind: held 1.5 s it lifted their player 1.58 u and turned the ability read on (Shift, Q, F, E, V, X, G, Z, Alt did not). Bots: botcore pressing it lifted every bot on foot 1.66-1.98 u with the ability read on, 4 of 4 (the 3 seated in a Mongoose or Ghost did not, as in the game; logs/tmp/h4_press_test.py)"
+  },
+  {
+   "off": 64,
+   "mask": 49344,
+   "press": false,
+   "how": "decoded live 2026-10-29 04:25 (equipment=c): +0x40 0xC0C0 while held"
+  }
+ ],
+ "ability": [
+  {
+   "off": 8,
+   "mask": 256,
+   "press": false,
+   "how": "the equipment entry's own bits (both held), so a hold-mode kind that sends the ability button alone (brain/equipment.py hold_bit, tools/live_bots.py buttons) gets what lifted bots live on Oct 29: decoded live 2026-10-29 04:25 (tools/decode_buttons.py equipment=c, Regicide on Complex with every player's ability set to Jet Pack): +0x08 0x100 and +0x40 0xC0C0 while held. C is the owner's armor ability bind: held 1.5 s it lifted their player 1.58 u and turned the ability read on (Shift, Q, F, E, V, X, G, Z, Alt did not). Bots: botcore pressing it lifted every bot on foot 1.66-1.98 u with the ability read on, 4 of 4 (the 3 seated in a Mongoose or Ghost did not, as in the game; logs/tmp/h4_press_test.py)"
+  },
+  {
+   "off": 64,
+   "mask": 49344,
+   "press": false,
+   "how": "the equipment entry's own bits (both held), so a hold-mode kind that sends the ability button alone (brain/equipment.py hold_bit, tools/live_bots.py buttons) gets what lifted bots live on Oct 29: decoded live 2026-10-29 04:25 (equipment=c): +0x40 0xC0C0 while held"
+  }
+ ],
+ "cycle": [
+  {
+   "off": 64,
+   "mask": 4,
+   "press": false,
+   "how": "+0x40 bit 2, the one-second hold level: decoded from the owner's own input log, Nov 10 2026 (logs/owner_input_*.jsonl): during a real E hold at a Dominion terminal +0x40 goes 0x400000, then 0xC00000 at 0.3 s, then 0xC00004 at 1 s and 0xC0000C at 2 s; the capture finished at about 2.4 s. Used by brain/dom_base.py only while a bot holds a base; this button name is otherwise unused in Halo 4"
+  }
+ ],
+ "fire2": [
+  {
+   "off": 64,
+   "mask": 8,
+   "press": false,
+   "how": "+0x40 bit 3, the two-second hold level: decoded from the owner's own input log, Nov 10 2026 (logs/owner_input_*.jsonl): during a real E hold at a Dominion terminal +0x40 goes 0x400000, then 0xC00000 at 0.3 s, then 0xC00004 at 1 s and 0xC0000C at 2 s; the capture finished at about 2.4 s. Used by brain/dom_base.py only while a bot holds a base; this button name is otherwise unused in Halo 4"
+  }
+ ]
+}
