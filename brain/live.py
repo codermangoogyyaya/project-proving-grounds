@@ -24,8 +24,7 @@ NONE = 0xFFFFFFFF
 # tag file name -> the brain's weapon name (others keep their file name, spaces as underscores)
 WEAPON_ALIAS = {"sniper_rifle": "sniper", "rocket_launcher": "rockets", "plasma_cannon": "fuelrod",
                 "mp_needler": "needler", "energy_sword": "sword",
-                "energy_blade": "sword", "flak_cannon": "fuelrod",          # Halo 2 (and Halo 3's sword)
-                "automag": "pistol", "smg_silenced": "smg"}                 # ODST: its scoped pistol, the silenced SMG
+                "energy_blade": "sword", "flak_cannon": "fuelrod"}          # Halo 2 (and Halo 3's sword)
 # Reach / H2A / Halo 4 weapon tag name -> brain weapon name (brain/bot.py WEAPON_RANGE / WEAPON_RANK keys), for the map
 # exports' placements (tools/reach_export.py) and the guns read live by tag name (LiveH4F.weapon_name): one table, so a
 # gun in hand and the same gun on the map have one name. Names not listed pass through (dmr, magnum, shotgun ...).
@@ -47,7 +46,7 @@ TAG_ALIAS = {"sniper_rifle": "sniper", "rocket_launcher": "rockets", "energy_swo
              "new_flag": "flag", "skull": "ball", "oddball": "ball",   # the objectives in hand (Halo 4, H2A)
              # the infected's own swords (Halo 4 Flood's storm_flood_sword, H2A's h2a_energy_sword_infected): lunge
              # like the sword (their tags: autoaim range 2.25, angle 6, as the sword's); unnamed, a Flood played its
-             # prongs as a gun (band 5-25 u: backed off inside 5 u, swung from across the room; issue #3)
+             # prongs as a gun (band 5-25 u: backed off inside 5 u, swung from across the room; owner, issue #3)
              "flood_sword": "sword", "energy_sword_infected": "sword"}
 # the infected's own weapons by their tag names: seeing one in a hand says Infection / Flood whatever the variant's
 # name (brain/modes.py mode_of)
@@ -92,15 +91,6 @@ def flags_by_stand(weapons, held, stands, tags, teams, skip=(), third=(), loose=
     return out
 
 
-def team_scores(read, at, stride, players):
-    """{team: score} for teams 0 and 1 and every other team a player is on (lobbies of up to 8 teams: the player's Sandtrap
-    Oddball, Nov 11, five teams of three, read {0: 199, 1: 0}): one record per team, stride bytes apart, its int32 score
-    first (the two-team layouts the readers had: Halo 3 0x18, Reach 8, H2A / Halo 4 0x1C; teams 2+ INFERRED from them)."""
-    teams = {0, 1} | {d["team"] for d in (players or []) if isinstance(d.get("team"), int) and 0 <= d["team"] < 8}
-    b = read(at, stride * (max(teams) + 1)) or b""
-    return {t: struct.unpack_from("<i", b, t * stride)[0] for t in sorted(teams) if len(b) >= t * stride + 4}
-
-
 def one_flag_owner(flag, players, state):
     """One Flag: the flag stays on its stand while the teams swap sides each round, so its the player is the round's
     defenders, the team that spawns beside it (Reach Boardwalk: at round 2 every blue player spawned 1-3 u from the
@@ -114,6 +104,39 @@ def one_flag_owner(flag, players, state):
         if near:
             state["team"] = max(set(near), key=near.count)
     return state["team"] if state["team"] is not None else flag["team"]
+
+
+class Walked:
+    """Where units have really stood on foot this match (a bot's spawn pick must be ground someone walked: the AI's first
+    sight is often out of bounds, a spawn list holds spots under ramps and stairs, a zone centre can lie past a ledge:
+    live Corvette and Glacier, Nov 11, an all-bot team came back outside and under the map). Cells of CELL u, each with the
+    heights (0.5 u steps) seen there. A unit counts only AGE s after it was first seen, so where it spawned in does not.
+    near(x, y, z): somebody walked within about a cell of it, at that height (VERT u)."""
+    CELL, AGE, VERT, MIN_KNOWN = 3.0, 6.0, 1.2, 200
+
+    def __init__(s):
+        s.cells, s.born = {}, {}
+
+    def _key(s, x, y):
+        return (math.floor(x / s.CELL), math.floor(y / s.CELL))
+
+    def feed(s, now, units):
+        """units: [(id, (x, y, z))], alive and on foot."""
+        for uid, pos in units:
+            if now - s.born.setdefault(uid, now) >= s.AGE:
+                s.cells.setdefault(s._key(pos[0], pos[1]), set()).add(round(pos[2] * 2) / 2)
+
+    def near(s, x, y, z):
+        kx, ky = s._key(x, y)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for h in s.cells.get((kx + dx, ky + dy), ()):
+                    if abs(h - z) <= s.VERT:
+                        return True
+        return False
+
+    def known(s):
+        return len(s.cells) >= s.MIN_KNOWN
 
 
 class Live:
@@ -138,10 +161,7 @@ class Live:
         o = s.object(weapon_handle)
         if not o:
             return "none"
-        b = s.g.read(o, 4)
-        if not b:
-            return "none"           # (freed between the handle and the read)
-        name = s.tag_path(struct.unpack("<I", b)[0]).rsplit("\\", 1)[-1].replace(" ", "_")
+        name = s.tag_path(struct.unpack("<I", s.g.read(o, 4))[0]).rsplit("\\", 1)[-1].replace(" ", "_")
         return WEAPON_ALIAS.get(name, name)
 
     BATTERY = {"plasma_pistol", "plasma_rifle"}     # no rounds: a charge (not decoded)
@@ -181,7 +201,6 @@ class Live:
     # a vehicle's body as each game keeps it on the object, the field its players' health is read from (a vehicle is a
     # unit): (offset, True when the float is damage taken, 1.0 = gone, not health left)
     VEH_VITAL = (0x9C, False)
-    VEHICLE_TYPES = (1,)        # the object types read as vehicles (objects(): Halo 4 adds its giants, LiveH4F)
     # the game's own "destroyed" bit: object damage flags byte at DEAD_AT, bit 2 (CE's _object_dead_bit). DERIVED from each
     # DLL's object_get_health script function (backups/mcc-2025.08.16, the Ghidra build), which answers 0 when it is set:
     # Halo 2 +0x10A, Halo 3 +0x110, ODST +0x104, Reach +0x138, Halo 4 / H2A +0x16C. None (CE): its MP vehicles cannot
@@ -393,10 +412,7 @@ class LiveH2(Live):
         o = s.object(handle) if s.AMMO_AT else None
         if not o:
             return -1, -1
-        b = s.g.read(o, 4)
-        if not b:                   # (freed between the handle and the read)
-            return -1, -1
-        tag = struct.unpack("<I", b)[0]
+        tag = struct.unpack("<I", s.g.read(o, 4))[0]
         reserve = struct.unpack("<h", s.g.read(o + s.AMMO_AT, 2))[0]
         mag = struct.unpack("<h", s.g.read(o + s.MAG_AT, 2))[0]
         top = s.__dict__.setdefault("_rounds_seen", {})
@@ -407,10 +423,6 @@ class LiveH2(Live):
             return -1, -1
         return max(0, reserve) + max(0, mag), max(0, mag)
     PARENT_AT = 0x14       # object +0x14 parent (Halo 3 +0x10)
-    # object +0x64 position, its forward +0x70 and up +0x7C after it (tools/live_bots.vehicle_fwd): live Nov 7, Coagulation,
-    # every vehicle's two unit vectors square to each other, a Warthog on its side read up z -0.39. Until then Halo 2's
-    # vehicles had no facing: a gunner aimed from its Warthog's middle (Bot.gun_origin), none read as on its side
-    POS_AT = 0x64
     SLOTS_AT = 0x22C       # unit +0x22C 4 weapon handles (as flags() reads them)
 
     def ground_weapons(s):
@@ -494,15 +506,9 @@ class LiveH2(Live):
         """The running map's scenario name (lockout, ...): the tag named scenarios\\multi\\..\\<n>\\<n>
         (tag order differs between loads: tag 0 is the scenario on one, globals on another)."""
         import re
-        # (smaller reads where the whole one fails: a read past the end of the table's memory reads nothing, and on
-        # Containment 512 KB did, 256 KB not, so bots never started there: live Nov 7, "bots do not know the map 'h2_'")
-        at = s.g.u64(s.g.base + s.NAMES)
-        for n in (19, 18, 17, 16, 14):
-            names = s.g.read(at, 1 << n) or b""
-            m = re.search(rb"scenarios\\multi\\(?:\w+\\)*(\w+)\\\1\x00", names)
-            if m:
-                return m.group(1).decode()
-        return None
+        names = s.g.read(s.g.u64(s.g.base + s.NAMES), 1 << 19) or b""
+        m = re.search(rb"scenarios\\multi\\(?:\w+\\)*(\w+)\\\1\x00", names)
+        return m.group(1).decode() if m else None
 
     VARIANT = 0xE71CD0     # the running game variant (same layout as halo2\game_variants\*.bin;
                            # the copy the engine code reads): +0x44 engine (1 CTF, 2 Slayer,
@@ -620,23 +626,6 @@ class LiveH2(Live):
         return out
 
 
-def _on_frame(g, r):
-    """The world place of r (forward, left, up) on a vehicle whose object header g holds its position (g[0:3]), forward
-    (g[3:6]) and up (g[6:9]) axes (LiveH3._weapons_held's riding frames)."""
-    from .core import Vec
-    f, u = g[3:6], g[6:9]
-    lft = (u[1] * f[2] - u[2] * f[1], u[2] * f[0] - u[0] * f[2], u[0] * f[1] - u[1] * f[0])
-    return Vec(*(g[k] + r[0] * f[k] + r[1] * lft[k] + r[2] * u[k] for k in range(3)))
-
-
-def _in_frame(g, pos):
-    """pos (x, y, z) as (forward, left, up) on that vehicle's frame: _on_frame's inverse (its axes orthonormal)."""
-    f, u = g[3:6], g[6:9]
-    lft = (u[1] * f[2] - u[2] * f[1], u[2] * f[0] - u[0] * f[2], u[0] * f[1] - u[1] * f[0])
-    d = [pos[k] - g[k] for k in range(3)]
-    return tuple(sum(d[k] * ax[k] for k in range(3)) for ax in (f, lft, u))
-
-
 class LiveH3(LiveH2):
     """Halo 3 (halo3.dll, MCC 1.3528, docs/H3-01). Engine globals in the game thread's TLS block
     for halo3.dll (tools/tls.py): +0x10 players array header, +0x38 object header array (header
@@ -656,7 +645,6 @@ class LiveH3(LiveH2):
     TRACKER_AT = 0x214
     # Halo 3 magazine sizes that belong to one gun only (measured: every H3 trace; 6 is the brute shot and the
     # shotgun, 8 the magnum and the missile pod: not used)
-    OWN_GUNS = "h3"       # guns named by the .map file's own tag names (_own_gun; tools/reach_tag_names game), None: not
     MAG_NAMES = {32: "assault_rifle", 36: "battle_rifle", 60: "smg", 40: "spike_rifle", 19: "needler",
                  18: "covenant_carbine", 5: "excavator", 4: "sniper"}
 
@@ -682,7 +670,6 @@ class LiveH3(LiveH2):
     # object layout for flags(): TLS offset of the object headers, the entry's type byte, object position; unit slots
     OBJECTS_AT, TYPE_AT, POS_AT, SLOTS_AT = 0x38, 3, 0x50, 0x268
     CACHE_HEADER = 0x20A9058
-    TAG_GAME = "h3"         # the map's tag names for its live scenery and crates (brain/forge.py live_pieces)
 
     def __init__(s):
         import tls
@@ -851,12 +838,9 @@ class LiveH3(LiveH2):
         o = s.object(weapon_handle)
         if not o:
             return "none"
-        b = s.g.read(o, 4)
-        if not b:                   # (freed between the handle and the read: live ODST Firefight, an AI's gun every tick
-            return "none"           # for 3 s, the brain stopped as "game gone")
-        tag = struct.unpack("<I", b)[0]
+        tag = struct.unpack("<I", s.g.read(o, 4))[0]
         s.__dict__.setdefault("_ever_held", set()).add(weapon_handle)   # (asked for guns in hands: _was_held)
-        own = s._own_gun(tag) if s.OWN_GUNS else None      # (Halo 3, ODST: the map's tag names first, _own_gun)
+        own = s._own_gun(tag) if s.MAG_NAMES else None     # (Halo 3: the map's tag names first, _own_gun)
         if own:
             return own
         if tag not in s._names and s.MAG_NAMES:
@@ -883,14 +867,14 @@ class LiveH3(LiveH2):
     def _melee_name(s, tag):
         """Halo 3: a weapon's name by the map's own tag names (tools/reach_tag_names.py reads Halo 3's .map files too):
         "objects\\weapons\\...\\X\\X" at the tag's index, else None. Rat's Nest places no sword, so Infection's zombies
-        held "unknown" and played their swords as guns (band 5-25 u: backed off inside 5 u, swung from far;
+        held "unknown" and played their swords as guns (band 5-25 u: backed off inside 5 u, swung from far; owner,
         issue #3)."""
         names = s.__dict__.get("_h3_tag_names")
         if names is None:
             try:
                 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
                 import reach_tag_names
-                names = reach_tag_names.cached(s.map_name(), s.OWN_GUNS or "h3")
+                names = reach_tag_names.cached(s.map_name(), "h3")
             except Exception:
                 names = []
             s._h3_tag_names = names
@@ -921,30 +905,11 @@ class LiveH3(LiveH2):
                 used.add(h)
                 g = s._riding_frame.get(h)
                 if g:     # where that team captures rides the same vehicle (live_returns, the brain's capture point)
-                    rets[t] = _on_frame(g, ELEPHANT["flag_return"])
-                    # (its vehicle and the stand's place on it: followed below while the flag is away)
-                    s.__dict__.setdefault("_stand_ride", {})[t] = (s._riding[h], _in_frame(g, pos))
-        # a stand whose flag is away (carried, dropped) follows its vehicle every read, as people see it drive off with
-        # the base: its last place stood while the Elephant moved (live Nov 11: a stand riding its Elephant)
-        for t, (gp, loc) in getattr(s, "_stand_ride", {}).items():
-            if t in live:
-                continue
-            gpo = s.object(gp)
-            if not gpo:
-                continue
-            g = struct.unpack("<9f", s.g.read(gpo + s.POS_AT, 36))
-            live[t], rets[t] = _on_frame(g, loc), _on_frame(g, ELEPHANT["flag_return"])
-        # a map variant's own stands (Sandtrap's variant "SAND TARP", One Flag: its flag hung on a stand 23.7 u from the
-        # map's stand points, read as Slayer, live Nov 11): before any flag is known, a weapon hung on a stand object where
-        # no map stand is becomes a stand of the team whose map stand is nearest (One Flag's owner: one_flag_owner)
-        if not getattr(s, "_flag_tags", None):
-            for h, tag, parent, pos in weapons:
-                if h not in getattr(s, "_on_stand", ()) or h in s._riding or h in held:
-                    continue
-                d2 = {t: (pos[0] - st.x) ** 2 + (pos[1] - st.y) ** 2 for t, st in stands.items()}
-                t = min(d2, key=d2.get)
-                if d2[t] > 0.6 ** 2 and t not in live:
-                    live[t] = Vec(*pos)
+                    # ponytail: the Elephant's marker for any stand on a vehicle; Sandtrap's are the only ones known
+                    f, u, r = g[3:6], g[6:9], ELEPHANT["flag_return"]
+                    lft = (u[1] * f[2] - u[2] * f[1], u[2] * f[0] - u[0] * f[2], u[0] * f[1] - u[1] * f[0])
+                    rets[t] = Vec(*(g[k] + r[0] * f[k] + r[1] * lft[k] + r[2] * u[k] for k in range(3)))
+        # (a carried flag's stand is not seen: its last place stands)
         s.live_stands = live = {**getattr(s, "live_stands", {}), **live}
         s.live_returns = {**getattr(s, "live_returns", {}), **rets}
         if live:
@@ -1039,7 +1004,7 @@ class LiveH3(LiveH2):
 
     def _weapons_held(s, players):
         """([(handle, tag, +0x14, pos)] of every weapon object, {weapon handle: player} of those in a unit's slots)."""
-        held, s._third, s._attached, s._riding, s._riding_frame, s._on_stand = {}, set(), set(), {}, {}, set()
+        held, s._third, s._attached, s._riding, s._riding_frame = {}, set(), set(), {}, {}
         for p in (p for p in players if p.get("pos") is not None):
             o = s.object(p["unit"])
             if o:
@@ -1069,8 +1034,6 @@ class LiveH3(LiveH2):
                 if po and po not in (s.object(p["unit"]) for p in players if p.get("pos") is not None):
                     base = struct.unpack("<3f", s.g.read(po + s.POS_AT, 12))
                     pos = (base[0] + pos[0], base[1] + pos[1], base[2] + pos[2])
-                    if (parent & 0xFFFF) < mx and b[(parent & 0xFFFF) * 0x18 + s.TYPE_AT] == 10:
-                        s._on_stand.add(h)  # hung on a stand object (a flag's), wherever that stand is (LiveH3.flags)
                     # and that marker on a vehicle (Halo 3 Sandtrap: each CTF flag's stand rides its team's Elephant;
                     # the flag read 1.4 u from the map's origin and Multi Flag played as Slayer): the vehicle's place
                     # plus the offset along its axes (forward, then up, after its position)
@@ -1143,7 +1106,8 @@ class LiveH3(LiveH2):
         ticks = struct.unpack("<i", s.g.read(gg + s.H3_TICKS, 4))[0]
         score = {}
         if teams:
-            score = team_scores(s.g.read, gg + s.H3_TEAM_SCORE, 0x18, players)
+            b = s.g.read(gg + s.H3_TEAM_SCORE, 0x30)
+            score = {0: struct.unpack_from("<i", b, 0)[0], 1: struct.unpack_from("<i", b, 0x18)[0]}
         left = max(0.0, minutes * 60.0 - ticks / 60.0) if minutes else None
         return dict(score=score, limit=max(0, limit), time_left=left)
 
@@ -1203,14 +1167,9 @@ class LiveReach(LiveH3):
     name. Object entry (0x18): +0 salt, +4 type (2 weapon, 3 equipment), +0x10 object address.
     Object +0 tag, +0xC next sibling, +0x10 first child, +0x14 parent, +0x44 position (feet),
     +0x50 forward; unit +0x350 4 weapon handles, +0x374 armor ability."""
-    # its own tag names (brain/forge.py _tag_names), not LiveH3's: inheriting "h3" (bd94362, Nov 12) read Reach maps' tag
-    # names from Halo 3's folder, and every Reach reader naming objects by tag failed quietly (live Beachhead Generator
-    # Defense, Nov 12: no generator read in 299 snapshots, the bots played plain Firefight: GitHub #18)
-    TAG_GAME = "reach"
     UNIT_ZOOM = None      # the unit's desired zoom byte (not decoded)
     DEAD_AT, HEALTH_BLOCK = 0x138, 0x184   # (Live.vehicle_dead / vehicle_left; ghidra/hr_object_get_health.c)
     MAG_NAMES = {}        # (Halo 3's magazine sizes are not this game's)
-    OWN_GUNS = None       # (its own naming: weapon_name, _own_name)
     # a gun's reserve and magazine (int16), found live (Beachhead Firefight Nov 6, logs/tmp/reach_ammo_scan.py): a
     # magnum's magazine +0x2CA fell one a shot and refilled to 8 as the reserve +0x2C6 paid it (8 -> 0, 18 -> 10,
     # 10 -> 2), the reserve rose 0 -> 18 at a pickup. Unread before: Reach bots had no ammo, so none ever went for a
@@ -1293,7 +1252,8 @@ class LiveReach(LiveH3):
         if s._blk is None:
             s.players()
         gg = s.g.u64(s._blk + 0x48)
-        score = team_scores(s.g.read, gg + s.REACH_TEAM_SCORE, 8, players)
+        b = s.g.read(gg + s.REACH_TEAM_SCORE, 16)
+        score = {0: struct.unpack_from("<i", b, 0)[0], 1: struct.unpack_from("<i", b, 8)[0]}
         limit = struct.unpack("<h", s.g.read(gg + s.REACH_SCORE_LIMIT, 2))[0] if s.REACH_SCORE_LIMIT else 0
         left = None
         if s.REACH_TIME_LIMIT:
@@ -1314,28 +1274,6 @@ class LiveReach(LiveH3):
         s._bare_players = set()
         s._find()
 
-    def spartan_head_position(s, address, unit, feet):
-        """The Spartan's animated head (its target_head marker on its head bone) in world space, or None: the 82-node
-        multiplayer Spartan (bone block descriptor at unit +0x178, array at +0xF1C, 52-byte transforms, head node 38);
-        an Elite, a bad scale or axes, or a point off the body read None (the fixed head height then). A person aims at
-        the head he sees, which leans and dips as the man strafes and crouches (the collaborator's fork,
-        c9a9b1f, confirmed there on the DMR)."""
-        size, offset = struct.unpack_from("<HH", unit, 0x178)
-        if (size, offset) != (82 * 52, 0xF1C):
-            return None
-        raw = s.g.read(address + offset + 38 * 52, 52)
-        if raw is None or len(raw) != 52:
-            return None
-        scale, *m = struct.unpack("<13f", raw)
-        if not all(map(math.isfinite, (scale, *m))) or not 0.95 <= scale <= 1.05:
-            return None
-        if any(abs(sum(v * v for v in m[k:k + 3]) - 1.0) > 0.08 for k in (0, 3, 6)):
-            return None
-        point = tuple(m[9 + i] + scale * (0.01772663 * m[i] - 0.0063144267 * m[3 + i]) for i in range(3))
-        if math.hypot(point[0] - feet[0], point[1] - feet[1]) > 0.8 or not 0.15 < point[2] - feet[2] < 1.05:
-            return None
-        return point
-
     MAGAZINE = {15: "dmr", 32: "assault_rifle", 8: "magnum", 21: "needle_rifle", 4: "sniper", 6: "shotgun",
                 2: "rockets"}   # ponytail: by magazine size; battery weapons stay "unknown"
 
@@ -1346,10 +1284,7 @@ class LiveReach(LiveH3):
         o = s.object(weapon_handle)
         if not o:
             return "none"
-        b = s.g.read(o, 4)
-        if not b:                   # (freed between the handle and the read: live ODST Firefight, an AI's gun every tick
-            return "none"           # for 3 s, the brain stopped as "game gone")
-        tag = struct.unpack("<I", b)[0]
+        tag = struct.unpack("<I", s.g.read(o, 4))[0]
         s.__dict__.setdefault("_ever_held", set()).add(weapon_handle)   # held: never names a spawn (_was_held)
         if tag in s._names:
             return WEAPON_ALIAS.get(s._names[tag], s._names[tag])
@@ -1581,6 +1516,17 @@ class LiveReach(LiveH3):
         fx, fy = struct.unpack_from("<2f", head, 0x50)
         return x, y, z, math.atan2(fy, fx)
 
+    def spawn_point(s, index):
+        """(x, y, z, yaw) of the spawn point stored in player `index` (+0x3EC: position, then facing): where the game last
+        put him, its own pick for his team (Firefight's death screen, reach.cpp hr_bot_spawn_point). None before his first."""
+        base, mx, size = s._array(s.PLAYERS_AT)
+        if not 0 <= index < mx:
+            return None
+        x, y, z, fx, fy, _ = struct.unpack("<6f", s.g.read(base + index * size + 0x3EC, 24))
+        if not all(math.isfinite(v) for v in (x, y, z, fx, fy)) or not (x or y or z):
+            return None
+        return (x, y, z, math.atan2(fy, fx))
+
     def core(s, players, stand, key="core"):
         """Invasion's core: the weapon object first seen on its stand (a Vec), found as flags are (flags_by_stand),
         once phase 3 puts it there. [{pos, carrier}] (empty before phase 3). key: another object's own tags (Breakpoint's
@@ -1665,7 +1611,7 @@ class LiveReach(LiveH3):
             name = b[0xB0:0xD0].decode("utf-16-le", "replace").partition(chr(0))[0]
             o = s.object(unit)
             # the joined configuration sits at +0x90 (name +0x20, team byte +0x98)
-            d = dict(index=i, name=name, team=b[0x128], side=b[0xAC], unit=unit, pos=None, fwd=None,   # (side: Firefight)
+            d = dict(index=i, name=name, team=b[0x128], unit=unit, pos=None, fwd=None,
                      aim=None, vehicle=-1, health=0.0, shield=0.0, weapon="none")
             if o:
                 u = s.g.read(o, 0x400)
@@ -1682,8 +1628,6 @@ class LiveReach(LiveH3):
                 d["weapon"] = s.weapon_name(held) if held != NONE else (d["weapons"][0] if d["weapons"] else "none")
                 rounds = [s.rounds(w) for w in slots if w != NONE]
                 d["ammo"], d["mag"] = [a for a, _ in rounds], [g for _, g in rounds]
-                if parent == NONE:          # on foot: the head where the body has it (spartan_head_position)
-                    d["head_pos"] = s.spartan_head_position(o, u, d["pos"])
                 d["equipment"], d["ability_on"] = s.ability(struct.unpack_from("<I", u, s.ABILITY_AT)[0])
             out.append(d)
         for d in out:                # enemies on his motion tracker (tracker() per game)
@@ -1699,88 +1643,23 @@ class LiveReach(LiveH3):
 
     # unit's side byte: Spartan players 1, Elite players 7, the Covenant AI 3 (live Beachhead Nov 6, Classic and Versus)
     UNIT_TEAM = 0x1CA
-    # an AI unit's actor (TLS +0x8 "actor" array) and the actor's character tag, objects\characters\<species>\ai\<rank>
-    # (grunt_major, jackal_sniper, elite_ultra, ...): live Beachhead Versus Nov 8 (tools/ff_inspect.py)
-    ACTOR_AT, ACTOR_CHARACTER = 0x1BC, 0x6C
 
-    def ff_lives(s):
-        """Firefight: each side's lives (game globals +0x16C + side * 4; side 1 the Spartans' shared pool, 7 the Elites'
-        -1, no limit), [8 ints], or None."""
-        try:
-            return list(struct.unpack("<8i", s.g.read(s.g.u64(s._blk + 0x20) + 0x16C, 32)))
-        except Exception:
-            return None
+    AI_DEAD_BIT, AI_DEAD_HEALTH = True, True     # the two dead-body tests of ai_units (False: off, if one reads a live unit dead)
 
-    def ff_zones(s):
-        """Firefight's respawn zones (firefight_respawn_zone scenery: the places a person picks on the death screen),
-        [(x, y, z)], read once a map."""
-        key = s.map_name()
-        if getattr(s, "_ff_zones", (None,))[0] != key:
-            from .forge import _tag_names
-            names = _tag_names(s) or []
-            ents, mx, _ = s._array(0x10)
-            b = s.g.read(ents, mx * 0x18)
-            out = []
-            for i in range(mx):
-                if not struct.unpack_from("<H", b, i * 0x18)[0] or b[i * 0x18 + 4] != 6:
-                    continue
-                o = struct.unpack_from("<Q", b, i * 0x18 + 0x10)[0]
-                u = s.g.read(o, 0x50)
-                t = struct.unpack_from("<I", u, 0)[0] & 0xFFFF
-                if t < len(names) and names[t].endswith("firefight_respawn_zone"):
-                    out.append(struct.unpack_from("<3f", u, 0x44))
-            s._ff_zones = (key, out)
-        return s._ff_zones[1]
-
-    def ff_generators(s):
-        """Generator Defense's generators (live Beachhead Nov 8, logs/tmp/gen_watch.py): each generator_x_large machine
-        with its shield / body damage (+0x124 / +0x128, as a unit's), health 1 full .. 0 gone, and its three switches
-        (controls parented to it, +0x14): "gen" (the lockdown switch: power +0x1B0 1 while it can be locked), "cool",
-        "disabled"; a destroyed generator's damage reads 0 again and every switch 0, as a locked one's. [dict(handle, pos, health,
-        sw={name: power})], [] on other maps."""
-        from .forge import _tag_names
-        names = _tag_names(s) or []
-        ents, mx, _ = s._array(0x10)
-        b = s.g.read(ents, mx * 0x18)
-        gens, sws = {}, []
-        for i in range(mx):
-            salt = struct.unpack_from("<H", b, i * 0x18)[0]
-            if not salt or b[i * 0x18 + 4] not in (7, 8):        # (machines and controls)
-                continue
-            o = struct.unpack_from("<Q", b, i * 0x18 + 0x10)[0]
-            u = s.g.read(o, 0x1B4)
-            t = struct.unpack_from("<I", u, 0)[0] & 0xFFFF
-            n = names[t].rsplit("\\", 1)[-1] if t < len(names) else ""
-            if n == "generator_x_large":
-                sh, body = struct.unpack_from("<2f", u, 0x124)
-                gens[(salt << 16) | i] = dict(handle=(salt << 16) | i, pos=struct.unpack_from("<3f", u, 0x44),
-                                              health=max(0.0, 1.0 - 0.5 * (sh + body)), sw={})
-            elif n.startswith("invisible_switch_gen"):
-                sws.append((struct.unpack_from("<I", u, 0x14)[0], n[len("invisible_switch_"):],
-                            struct.unpack_from("<f", u, 0x1B0)[0]))
-        for parent, n, power in sws:
-            if parent in gens:
-                gens[parent]["sw"][{"gen": "gen", "gen_cool": "cool", "gen_disabled": "disabled"}.get(n, n)] = power
-        return sorted(gens.values(), key=lambda g: g["handle"] & 0xFFFF)   # (alive / locked: tools/live_bots.py gen_state)
-
-    def ai_rank(s, unit_bytes):
-        """An AI unit's rank, its character tag's name ("grunt_major"), or None (no actor: a player's, or a dead body)."""
-        a = struct.unpack_from("<I", unit_bytes, s.ACTOR_AT)[0]
-        if a == NONE:
-            return None
-        try:
-            data, mx, size = s._array(0x8)
-            if (a & 0xFFFF) >= mx:
-                return None
-            e = s.g.read(data + (a & 0xFFFF) * size, s.ACTOR_CHARACTER + 4)
-            if struct.unpack_from("<H", e, 0)[0] != a >> 16:
-                return None
-            from .forge import _tag_names
-            names = _tag_names(s) or []
-            t = struct.unpack_from("<I", e, s.ACTOR_CHARACTER)[0] & 0xFFFF
-            return names[t].rsplit("\\", 1)[-1] if t < len(names) and names[t] else None
-        except Exception:
-            return None
+    def ai_body_dead(s, addr, u):
+        """A dead AI body: the game's destroyed bit (DEAD_AT, bit 2: object_get_health answers 0 when it is set), or the
+        health read through the object's health block (HEALTH_BLOCK, as Live.vehicle_left) at or under 0. Not read live
+        on a body yet (as DEAD_AT's note says): the two switches above turn either test off."""
+        if s.AI_DEAD_BIT and u[s.DEAD_AT] & 4:
+            return True
+        if s.AI_DEAD_HEALTH:
+            try:
+                size, at = struct.unpack("<hH", u[s.HEALTH_BLOCK:s.HEALTH_BLOCK + 4])
+                if size >= 0x18 and struct.unpack("<f", s.g.read(addr + at + 0x10, 4))[0] <= 0.0:
+                    return True
+            except Exception:
+                pass
+        return False
 
     def ai_units(s, players):
         """Firefight: the AI's bipeds as player-like dicts (index 1000 + object slot): human-side AI (UNIT_TEAM 1, 2) on
@@ -1796,16 +1675,19 @@ class LiveReach(LiveH3):
             salt = struct.unpack_from("<H", b, i * 0x18)[0]
             if not salt or b[i * 0x18 + 4] != 0:
                 continue
-            u = s.g.read(struct.unpack_from("<Q", b, i * 0x18 + 0x10)[0], 0x214)
+            addr = struct.unpack_from("<Q", b, i * 0x18 + 0x10)[0]
+            u = s.g.read(addr, 0x214)
             if ((salt << 16) | i) in punits:
                 side.setdefault(u[s.UNIT_TEAM], punits[(salt << 16) | i])
                 continue
             shield_dmg, body_dmg = struct.unpack_from("<2f", u, 0x124)
             if struct.unpack_from("<I", u, 0x14)[0] != NONE or body_dmg >= 1.0:
                 continue
+            if s.ai_body_dead(addr, u):      # a dead body lies about for a while: its body damage can read back low, and
+                continue                     # the bots shot at it (the owner, Nov 10: "shooting at dead bodies")
             if struct.unpack_from("<I", u, 0x1D0)[0] != NONE:   # a player's (a bot's old body)
                 continue
-            out.append(dict(index=1000 + i, name="ai", team=u[s.UNIT_TEAM], unit=(salt << 16) | i, rank=s.ai_rank(u),
+            out.append(dict(index=1000 + i, name="ai", team=u[s.UNIT_TEAM], human=u[s.UNIT_TEAM] in (1, 2), unit=(salt << 16) | i,
                             pos=struct.unpack_from("<3f", u, 0x44), fwd=struct.unpack_from("<3f", u, 0x50),
                             aim=struct.unpack_from("<3f", u, 0x208), vehicle=-1, weapon="unknown", weapons=[],
                             **dict(zip(("shield", "health"), s._vitals((salt << 16) | i, shield_dmg, body_dmg, player=False)))))
@@ -1813,6 +1695,47 @@ class LiveReach(LiveH3):
             d["team"] = side.get(1 if d["team"] in (1, 2) else 7, -1)
         return out
 
+    SEAT_AT = 0x336      # a unit's seat in the vehicle it rides (the game's own enter/exit test reads it: reach.cpp)
+
+    def ai_riders(s, players):
+        """Firefight: the AI sitting in vehicles, which ai_units leaves out (a rider's position is relative to its
+        vehicle): [{index, unit, vehicle (the object it is parented to: the vehicle, or a turret on it), seat, human,
+        team (as ai_units: the team of the players on its side, -1 with none), aim}].
+        Without these a Ghost, Wraith or Warthog the Covenant drives reads as EMPTY: bots queued up to drive it, and
+        nobody hijacked it. Same tests as ai_units for a dead body or a player's unit; the seat byte is read apart (it
+        lies past the 0x214 bytes read per unit) and is None where the read fails."""
+        punits = {p["unit"]: p["team"] for p in players}
+        ents, mx, _ = s._array(0x10)
+        b = s.g.read(ents, mx * 0x18)
+        out, side = [], {}
+        for i in range(mx):
+            salt = struct.unpack_from("<H", b, i * 0x18)[0]
+            if not salt or b[i * 0x18 + 4] != 0:
+                continue
+            addr = struct.unpack_from("<Q", b, i * 0x18 + 0x10)[0]
+            u = s.g.read(addr, 0x214)
+            handle = (salt << 16) | i
+            if handle in punits:
+                side.setdefault(u[s.UNIT_TEAM], punits[handle])
+                continue
+            parent = struct.unpack_from("<I", u, 0x14)[0]
+            if parent == NONE:
+                continue
+            if (parent & 0xFFFF) >= mx or b[(parent & 0xFFFF) * 0x18 + 4] != 1:   # (parented to a vehicle object only)
+                continue
+            if struct.unpack_from("<2f", u, 0x124)[1] >= 1.0 or s.ai_body_dead(addr, u):
+                continue
+            if struct.unpack_from("<I", u, 0x1D0)[0] != NONE:
+                continue
+            try:
+                seat = struct.unpack("<b", s.g.read(addr + s.SEAT_AT, 1))[0]
+            except Exception:
+                seat = None
+            out.append(dict(index=1000 + i, unit=handle, vehicle=parent, seat=seat, sidebyte=u[s.UNIT_TEAM],
+                            human=u[s.UNIT_TEAM] in (1, 2), aim=struct.unpack_from("<3f", u, 0x208)))
+        for d in out:
+            d["team"] = side.get(1 if d["sidebyte"] in (1, 2) else 7, -1)
+        return out
 
 class LiveODST(LiveH3):
     """Halo 3: ODST Firefight (halo3odst.dll, MCC 1.3528; docs/NEXT-01). The Halo 3 layout with
@@ -1821,17 +1744,11 @@ class LiveODST(LiveH3):
     +0x50 position, +0x5C forward, +0x198 aim, +0xE8 health / +0xEC shield (fractions), +0x274
     weapon set / +0x276 primary index, +0x27C weapon handles. Cache header 'daeh' at +0x20EF068."""
     UNIT_ZOOM = None      # the unit's desired zoom byte (not decoded)
-    # its guns by its .map file's tag names (h100.map: assault_rifle, automag, smg_silenced ...): its exported maps place
-    # none, so every gun, held or loose, read "unknown" and bots never chose a secondary nor took a gun (GitHub #17)
-    OWN_GUNS = "odst"
-    TAG_GAME = "odst"
     VEH_VITAL = (0xE8, False)   # (Live.vehicle_left: the unit health field players() reads)
     DEAD_AT = 0x104             # (Live.vehicle_dead; ghidra/odst_object_get_health.c)
     MAG_NAMES = {}        # (Halo 3's magazine sizes are not this game's)
     AMMO_AT = None        # rounds not decoded for this game (LiveH2.rounds reads unknown)
-    # (loose guns: LiveH2's reader over this game's object list with Halo 3's parent field, +0x10; CE's, kept here
-    # until a live check, read CE's offsets: no gun ever lay loose to the bots, GitHub #17 "will not pick up weapons
-    # placed on map or dropped")
+    ground_weapons = Live.ground_weapons   # unchanged (CE's offsets) until this game's are checked live
     CACHE_HEADER = 0x20EF068
     CHAIN_ATTACHED = False     # (ODST's object orientation not checked: LiveH3)
 
@@ -1880,30 +1797,12 @@ class LiveODST(LiveH3):
                 s._learn(tag, pos)
             if typ == 1 and parent == NONE and tag not in s._names:
                 s._learn_vehicle(tag, pos)
-            name = (s._own_gun(tag) if typ == 2 else None) or s._names.get(tag, "unknown")   # (#17: by its tag name)
-            out.append(((salt << 16) | i, typ, name, pos))
+            out.append(((salt << 16) | i, typ, s._names.get(tag, "unknown"), pos))
         return out
 
     def map_name(s):
         path = s.g.read(s.g.base + s.CACHE_HEADER + 0xE0, 256).partition(bytes(1))[0].decode("ascii", "replace")
         return path.rsplit("\\", 1)[-1] or None
-
-    def ground_weapons(s):
-        """Loose guns (LiveH2's), and the guns in weapon boxes, at their box: Firefight's sniper rifle and rockets lie in
-        weapon_box machines, attached to them at the box's own origin, so they never read loose (live Crater, #17
-        "will not pick up weapons placed on map"). A box's gun is taken like any gun lying there."""
-        out = LiveH2.ground_weapons(s)
-        names = s._h3_names() or []
-        for h, typ, name, _ in s.objects((2,)) if names else ():
-            o = s.object(h)
-            parent = struct.unpack("<I", s.g.read(o + s.PARENT_AT, 4))[0] if o else NONE
-            po = s.object(parent) if parent != NONE else None
-            if po is None or name == "unknown":
-                continue
-            k = struct.unpack("<I", s.g.read(po, 4))[0] & 0xFFFF
-            if k < len(names) and names[k].endswith("\\weapon_box"):
-                out.append((name, struct.unpack("<3f", s.g.read(po + 0x50, 12))))
-        return out
 
     def firefight(s):
         return True                 # ODST has no PvP in MCC: every match is Firefight
@@ -1970,51 +1869,6 @@ class LiveH4F(LiveReach):
     # (Live.vehicle_dead / vehicle_left: halo4.dll 0x180683124 and groundhog.dll 0x180683e80, object_get_health)
     DEAD_AT, HEALTH_BLOCK = 0x16C, 0x1D0
     AMMO_AT = None              # (rounds not decoded here: Reach's +0x2C6 / +0x2CA are not these games')
-    # the vehicles' object types: 1, and Halo 4's giants, 13 (the Mantis: halo4.dll's own object type table at
-    # 0x180d8f410 lists biped 0, vehicle 1 ... creature 12, giant 13; logs/tmp/h4_object_types.py). Read as type 1 only,
-    # the Mantis was in no vehicle list: no bot went for it, and a player in it rode "?" (Ragnarok 20261106-234103).
-    # Halo 4 only: this class reads H2A too, whose type 13 is not known to be a giant
-    @property
-    def VEHICLE_TYPES(s):
-        return (1, 13) if str(getattr(s.g, "dll", "")).lower() == "halo4.dll" else (1,)
-
-    def h4_spartan_pose(s, address, unit, position):
-        """Halo 4's Spartan (120-node rig: bone block descriptor at unit +0x1BC, head node 54, its target_head marker):
-        (the animated head, the unit's view point +0xD50), both or (None, None). The place read here is not the feet
-        (0.38 over the floor, bot.H2A_FEET): its head goes with this view point, never with a head height added to the
-        place. Captured 2,780 standing / strafing / crouched poses on Bloodline and Adrift (the collaborator's fork,
-        524af62). Not for Reach, H2A, a vehicle or another rig."""
-        unknown = (None, None)
-        if str(getattr(s.g, "dll", "")).lower() != "halo4.dll" or unit is None or len(unit) < 0x1C0:
-            return unknown
-        size, offset = struct.unpack_from("<HH", unit, 0x1BC)
-        if size != 120 * 52 or offset % 4 or not 0x700 <= offset <= 0x8000:
-            return unknown
-        raw = s.g.read(address + offset + 54 * 52, 52)
-        view_raw = s.g.read(address + 0xD50, 12)
-        if raw is None or len(raw) != 52 or view_raw is None or len(view_raw) != 12:
-            return unknown
-        scale, *m = struct.unpack("<13f", raw)
-        view = struct.unpack("<3f", view_raw)
-        base = struct.unpack_from("<3f", unit, 0x64)
-        if not all(map(math.isfinite, (scale, *m, *view, *base, *position))) or not .95 <= scale <= 1.05:
-            return unknown
-        axes = [m[k:k + 3] for k in (0, 3, 6)]
-        if any(abs(sum(x * y for x, y in zip(a, b)) - float(i == j)) > .08
-               for i, a in enumerate(axes) for j, b in enumerate(axes)):
-            return unknown
-        cross = (axes[0][1] * axes[1][2] - axes[0][2] * axes[1][1], axes[0][2] * axes[1][0] - axes[0][0] * axes[1][2],
-                 axes[0][0] * axes[1][1] - axes[0][1] * axes[1][0])
-        if sum(x * y for x, y in zip(cross, axes[2])) < .9:
-            return unknown
-        marker = (-6.9422384e-8, .02300628, -.006868857)
-        head = tuple(m[9 + i] + scale * sum(marker[j] * m[j * 3 + i] for j in range(3)) for i in range(3))
-        if (math.hypot(head[0] - position[0], head[1] - position[1]) > .8 or not -.2 < head[2] - position[2] < 1.05
-                or math.hypot(view[0] - base[0], view[1] - base[1]) > .2 or not .3 < view[2] - base[2] < .8
-                or sum((view[k] - position[k]) ** 2 for k in range(3)) > 1.0
-                or sum((view[k] - head[k]) ** 2 for k in range(3)) > .25):
-            return unknown
-        return head, view
 
     # objects for LiveH3.flags / balls / objective_items (Adrift): TLS +0x18, entry +4 type (2 weapon), object +8 tag,
     # +0x24 parent (a held gun's: the unit; a map gun's: the weapon pad it rests on), +0x40 position, absolute
@@ -2056,7 +1910,8 @@ class LiveH4F(LiveReach):
         if not p:                      # the block went away (a map load): find it again next time
             s._blk = None
             return None
-        score = team_scores(s.g.read, p + off, 0x1C, players)
+        b = s.g.read(p + off, 0x20)
+        score = {0: struct.unpack_from("<i", b, 0)[0], 1: struct.unpack_from("<i", b, 0x1C)[0]}
         limit, left = 0, None
         if m["limits"]:
             lslot, loff, moff = m["limits"]
@@ -2142,50 +1997,27 @@ class LiveH4F(LiveReach):
         ents, mx, _ = s._array(0x18)
         b = s.g.read(ents, mx * 0x18)
         out = []
-        mechs = 13 in s.VEHICLE_TYPES               # Halo 4: its Mantis is a biped in a match (_mech)
         for i in range(mx):
             salt, typ = struct.unpack_from("<H", b, i * 0x18)[0], b[i * 0x18 + 4]
-            if not salt or (types is not None and typ not in types and not (typ == 0 and mechs and 13 in types)):
+            if not salt or (types is not None and typ not in types):
                 continue
             o = struct.unpack_from("<Q", b, i * 0x18 + 0x10)[0]
             head = s.g.read(o, 0x50)
             tag = struct.unpack_from("<I", head, 0x8)[0]   # +0 is the same for every object here
             pos = struct.unpack_from("<3f", head, 0x40)
             h = (salt << 16) | i
-            if typ == 0 and mechs and s._mech(tag):
-                typ = 13
-            if types is not None and typ not in types:
-                continue
             if typ == 2 and h not in getattr(s, "_held", ()) and not s._was_held(h) and tag not in s._names:
                 s._learn(tag, pos)       # +0x14 is no parent here (0x3040 on foot): skip held guns instead
-            if typ in s.VEHICLE_TYPES and tag not in s._names and struct.unpack_from("<I", head, s.PARENT_AT)[0] == NONE:
-                # (a gun riding on a vehicle has it as its parent: left as it was)
-                n = s._vehicle_name(tag, giant=typ == 13)
+            if typ == 1 and tag not in s._names and struct.unpack_from("<I", head, s.PARENT_AT)[0] == NONE:
+                n = s._vehicle_name(tag)  # (a gun riding on a vehicle has it as its parent: left as it was)
                 if n:
                     s._names[tag] = n
             out.append(((salt << 16) | i, typ, s._names.get(tag, "unknown"), pos))
         return out
 
-    def _mech(s, tag):
-        """A biped that is a vehicle to the brain: Halo 4's Mantis (live on Forge Island, Nov 7: object type 0, a biped,
-        objects\\characters\\storm_mantis\\storm_mantis; giants, type 13, never showed). Reported as type 13 by
-        objects(), so the vehicle list has it and no bot ignores it any more."""
-        known = s.__dict__.setdefault("_mechs", {})
-        if tag not in known:
-            try:
-                from .forge import _tag_names
-                names = _tag_names(s)
-                k = tag & 0xFFFF
-                known[tag] = k < len(names) and "\\storm_mantis\\" in names[k] + "\\"
-            except Exception:
-                return False
-        return known[tag]
-
-    def _vehicle_name(s, tag, giant=False):
+    def _vehicle_name(s, tag):
         """A vehicle's file name at its tag's own index (the names are exact here, and its folder can differ from it:
-        h2a_mongoose\\h2a_gungoose; every vehicle read "unknown" before, so no bot planned a ride: Bloodline). giant: a
-        Halo 4 giant, named in any folder (the Mantis is objects\\characters\\storm_mantis\\storm_mantis on Ragnarok,
-        so it read "unknown" and no bot took it)."""
+        h2a_mongoose\\h2a_gungoose; every vehicle read "unknown" before, so no bot planned a ride: Bloodline)."""
         try:
             from .forge import _tag_names
             names = _tag_names(s)
@@ -2193,16 +2025,13 @@ class LiveH4F(LiveReach):
             return None
         k = tag & 0xFFFF
         p = names[k].split("\\") if k < len(names) else []
-        return p[-1] if p and (giant or "vehicles" in p[:-1]) else None
+        return p[-1] if "vehicles" in p[:-1] else None
 
     def weapon_name(s, weapon_handle):
         o = s.object(weapon_handle)
         if not o:
             return "none"
-        b = s.g.read(o + 0x8, 4)                                                     # tag at +0x8 (H2A)
-        if not b:
-            return "none"           # (freed between the handle and the read)
-        tag = struct.unpack("<I", b)[0]
+        tag = struct.unpack("<I", s.g.read(o + 0x8, 4))[0]                            # tag at +0x8 (H2A)
         s.__dict__.setdefault("_ever_held", set()).add(weapon_handle)   # held: never names a spawn (_was_held)
         if tag not in s._names:
             s._learn(tag, None)
@@ -2254,8 +2083,6 @@ class LiveH4F(LiveReach):
                 d["vehicle"] = parent if parent != NONE and s.object(parent) else -1
                 sh, hp = s._vitals(unit, *struct.unpack_from("<2f", u, 0x158))
                 d.update(pos=struct.unpack_from("<3f", u, 0x40), aim=struct.unpack_from("<3f", u, 0x4E0), shield=sh, health=hp)
-                if d["vehicle"] == -1:      # on foot: the head and the view point it goes with (h4_spartan_pose)
-                    d["head_pos"], d["view_pos"] = s.h4_spartan_pose(o, u, d["pos"])
                 d["equipment"], d["ability_on"] = s.ability(struct.unpack_from("<I", u, s.ABILITY_AT)[0])
             out.append(d)
         s._held = held

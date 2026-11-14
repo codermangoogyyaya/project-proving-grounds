@@ -26,13 +26,19 @@ ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 # per game (the live reader's TAG_GAME): the object types read (scenery, crate; machines: doors and lifts move, left
 # out) and the object's position, forward and up (Halo 4 / H2A: tools/forge_dump.py on the player's ALL ITEMS maps;
 # their crates hold the Forge pieces and a map's own crates, Adrift's included)
-TYPES = {"reach": (6, 10), "h4": (6, 11), "h2a": (6, 11), "h3": (6, 10)}
-AXES_AT = {"reach": (0x44, 0x50, 0x5C), "h4": (0x64, 0x70, 0x7C), "h2a": (0x64, 0x70, 0x7C),
-           "h3": (0x50, 0x5C, 0x68)}     # (Halo 3: LiveH3; its crates type 10, the Assault bomb stand's)
+TYPES = {"reach": (6, 10), "h4": (6, 11), "h2a": (6, 11)}
+AXES_AT = {"reach": (0x44, 0x50, 0x5C), "h4": (0x64, 0x70, 0x7C), "h2a": (0x64, 0x70, 0x7C)}
 # never solid, by name (brain/placed.py's list: markers, beacons, spawns ...), for the games whose scenery is read whole
 SKIP = ("door", "lift", "light", "camera", "cinematic", "skybox", "fx_", "sound", "hologram", "decal", "kill_volume",
         "danger_zone", "spawn", "marker", "beacon", "mp_circle", "flag_base", "flag_stand", "drop_point", "respawn",
         "health")
+
+# A piece smaller than this is left out of the nav (block). It was 0.35 high / 0.04 square: but a bot's step is
+# brain/terrain.py MAX_RISE (0.18), so a 0.2-0.35 u kerb, low wall or rock-like prop is a wall to a walking body, and a
+# piece dropped from the nav is one the bots walk straight into and stand pushing at. Anything a body cannot step onto
+# stays in; only what it walks over (under a step) and slivers thinner than the body are dropped.
+MIN_BLOCK_HEIGHT = 0.2
+MIN_BLOCK_AREA = 0.015
 
 _SHAPES = {}
 
@@ -212,21 +218,49 @@ def _faces(game="reach"):
     return _FACES[game]
 
 
+_NO_BLOCK_WARNED = set()    # (game, name, reason) already printed once: a piece silently dropped from the nav gets
+                            # no collision at all (bots run through it), and that had no trace until now
+NO_SHAPE_PLACEMENTS = []    # [(x, y, z), ...] every placement of a piece with no shape entry at all (not deduped by
+                            # name: each instance's own spot matters). A stuck report near one of these is
+                            # independently confirmed missing data, not just inferred from one bot's behavior
+                            # (terrain.learn_stuck's multi-bot vote exists for the inferred case, not this one)
+
+
+def _warn_no_block(game, name, reason, pos=None):
+    key = (game, name, reason)
+    if name and key not in _NO_BLOCK_WARNED:
+        _NO_BLOCK_WARNED.add(key)
+        print(f"forge: {name!r} ({game}) gets no nav collision: {reason}", file=sys.stderr)
+    if pos is not None:
+        NO_SHAPE_PLACEMENTS.append(tuple(pos))
+
+
+def missing_near(pos, r=3.0):
+    """Whether a piece confirmed to have no shape at all (_warn_no_block, NO_SHAPE_PLACEMENTS) sits within r of pos:
+    a stuck report there is independently explained by known-bad data, not just one bot's say-so."""
+    x, y = (pos.x, pos.y) if hasattr(pos, "x") else (pos[0], pos[1])
+    return any((x - q[0]) ** 2 + (y - q[1]) ** 2 <= r * r for q in NO_SHAPE_PLACEMENTS)
+
+
 def block(name, pos, axes, skip_materials=("energy", "hologram"), game="reach"):
     """One piece for the nav (nav_pieces): (pos, (forward, left, up), min, max, name[, faces]). A piece with its
     collision surfaces known carries them (faces) and goes into the nav face by face, a floor, ramp or wall by each
     face's angle, else as its solid box. None: unknown, energy and hologram alone (lights, power-ups; shields:
     apply_shields), or a box too low or small for a body to bump into. A building piece's own energy panes (the tall
-    tower's, the window wall's) are solid with it."""
+    tower's, the window wall's) are solid with it. Each way a piece drops out prints once (_warn_no_block): before,
+    a piece missing its shape (an unrecognized or uncatalogued name) vanished from the nav with no trace at all."""
     s, f = _shapes(game).get(name), _faces(game).get(name)
     if not s:
+        _warn_no_block(game, name, "no shape entry for this name in _shapes/reach.json", pos=pos)
         return None
     if f and not all(any(m in mat for m in skip_materials) for mat, _ in f):
         return pos, axes, s["min"], s["max"], name, f
     if any(m in s.get("material", "") for m in skip_materials):
+        _warn_no_block(game, name, f"shape's material ({s.get('material', '')!r}) is energy/hologram, skipped as non-solid")
         return None                               # (shields: apply_shields)
     lo, hi = s["min"], s["max"]
-    if hi[2] - lo[2] < 0.35 or (hi[0] - lo[0]) * (hi[1] - lo[1]) < 0.04:
+    if hi[2] - lo[2] < MIN_BLOCK_HEIGHT or (hi[0] - lo[0]) * (hi[1] - lo[1]) < MIN_BLOCK_AREA:
+        _warn_no_block(game, name, f"shape box too low/small to matter (min={lo}, max={hi})")
         return None
     return pos, axes, lo, hi, name
 
@@ -257,22 +291,19 @@ class PieceWatch:
     standing that the nav was not built with is a wall (its box's four sides, Terrain.set_barriers) while it stands; a
     piece the nav was built with that goes missing is dynamic: update returns it for variant.json "dynamic", and the
     next match's nav is built without it (brain/maps.py), so it is a wall here only while it stands. (A piece stamped in
-    at this match's start that goes stays a wall until the match ends: the nav has no way to take a stamp out.) Only a
-    piece seen live this match can go: a variant filed from its .mvar (tools/h3_forge_import.py) also lists what live
-    reads never return (vehicles, spawns, doors, equipment), and live Halo 3 filed 56 of those gone in 2 s."""
+    at this match's start that goes stays a wall until the match ends: the nav has no way to take a stamp out.)"""
 
     def __init__(s, built, dynamic=(), game="reach"):
         s.dynamic = set(dynamic)
         s.built = {piece_key(n, p) for n, p, _ in built} - s.dynamic   # stamped into this match's nav
-        s.game, s.missing, s.walls, s.absent, s.seen = game, {}, {}, {}, set()
+        s.game, s.missing, s.walls, s.absent = game, {}, {}, {}
 
     def update(s, pieces, T):
         """pieces: this read's [(name, pos, axes)]. Puts the walls on T; returns the built-in keys newly gone."""
         here = {piece_key(n, p): (n, p, a) for n, p, a in pieces}
-        s.seen |= s.built & here.keys()
-        for k in s.seen:
+        for k in s.built:
             s.missing[k] = 0 if k in here else s.missing.get(k, 0) + 1
-        gone = {k for k in s.seen if s.missing[k] == GONE_READS} - s.dynamic
+        gone = {k for k in s.built if s.missing[k] == GONE_READS} - s.dynamic
         s.dynamic |= gone
         items = {}
         for k, (n, p, a) in here.items():

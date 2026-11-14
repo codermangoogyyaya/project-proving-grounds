@@ -17,6 +17,7 @@ the game's CAPTURE_S owns it until the other team does the same (ponytail: the g
 import math
 
 from .core import Vec, dist
+from .dom_base import DOM_BASE_RADIUS, DOM_BASE_DZ, DOM_BASE_CAPTURE_S
 
 # the objective modes past CTF, King and Oddball: each has its own team plan in the director (mode_slots,
 # invasion_slots) and its own objective points (Director.objective_points)
@@ -36,7 +37,8 @@ NAMES = (("territories", ("TERRITOR", "LAND GRAB", "PLOTS")),("assault", ("ASSAU
 ALIAS = {"ricochet": "assault", "grifball": "assault", "dominion": "territories", "rally": "race"}
 KINDS = {"ricochet": {"rico_ballspawn": "bomb", "rico_endzone": "bomb_goal"},
          "grifball": {"grif_spawn": "bomb", "grif_goal": "bomb_goal"},
-         "dominion": {"dom_base_zone": "territory"}}
+         "dominion": {"dom_base": "dom_base", "dom_base_zone": "territory", "dom_shield": "dom_shield",
+                      "dom_turret": "dom_turret", "dom_fortify": "dom_fortify"}}
 # every game's names for the places the modes use (Reach's, and Halo 2's: its Assault plates are each team's "bomb
 # return" by its own base, its bombs' stands "bomb spawn" per team and one neutral; maps/h2_*/objects.json)
 PLACES = {"terr_object": "territory", "as_bomb": "bomb", "as_goal": "bomb_goal", "stp_flag": "stockpile_flag",
@@ -75,8 +77,8 @@ def mode_of(game, live):
         if mode is None and game in ("h2a", "reach"):
             mode = (H2A_ICONS if game == "h2a" else REACH_ICONS).get(live.engine_icon())
         if mode is None and getattr(live, "zombie_seen", False):
-            mode = "infection"       # an infected-only gun in a hand (live.ZOMBIE_TAGS): Halo 4 Flood read off as
-        return mode                  # Slayer (issue #3), whatever its variant is called
+            mode = "infection"       # an infected-only gun in a hand (live.ZOMBIE_TAGS): Halo 4 Flood "read off as
+        return mode                  # Slayer" (owner, issue #3), whatever its variant is called
     except Exception:
         return None
 
@@ -105,7 +107,7 @@ def layout(objs, mode=None):
     out = {}
     places = KINDS.get(mode, PLACES)
     for f in objs.get("netgame_flags", []):
-        kind = places.get(f["type"])
+        kind = places.get(f["type"]) or places.get(str(f["type"]).strip().lower())
         if kind:
             out.setdefault(kind, []).append((_v(f["pos"]), radius(f), f.get("team", 8)))
     if "bomb_goal" not in out:          # Halo 3: the bomb is armed on the CTF flag return areas (Construct: no
@@ -231,12 +233,91 @@ def kill_credit(victim, was, players, reach=60.0, cone=0.15):
     return best[1] if best else None
 
 
+# ---- Dominion (Halo 4): its places are read by LABEL only (the netgame flag's type in objects.json), so a custom map
+# works the same as a built-in one. dom_base: the terminal a man captures by standing at it and holding interact;
+# dom_base_zone (the capture area; the terminals' stand-in when a map has no dom_base); dom_turret, dom_shield: what a
+# fortified base spawns (dom_fortify marks where); a team's own are left alone, the other team's shot down first.
+DOM_USE_R = 1.0        # u from the terminal: close enough to use it (the bot stands right next to it, still)
+DOM_HOLD_S = DOM_BASE_CAPTURE_S   # seconds a base takes to capture (brain/dom_base.py: 5 s; the owner estimate below flips
+                                  # after it; the bot's own hold, dom_base.DOM_BASE_HOLD_S, is longer)
+DOM_BASE_R = DOM_BASE_RADIUS   # u: a man this close to the terminal (DOM_BASE_DZ up or down) is capturing it (dom_base.py)
+DOM_FORT_R = 14.0      # a turret or shield this close to a base belongs to that base (its owner's)
+DOM_DEF_SHARE = 0.35   # of a team's bots, at most this many defend (the rest attack: more attack than defend)
+DOM_DEF_PER_BASE = 2   # and no more than this many to a base
+FORT_NAMES = (("dom_turret", ("dom_turret",)), ("dom_shield", ("dom_shield", "dom_damage_team_shield")))
+
+
+def _fort_hostile(forts, team, base, r=DOM_FORT_R):
+    """The other team's turrets and shields within r of a base, [(kind, Vec)]: turrets first (they shoot), nearest first."""
+    out = [(k, p) for k, p, t in forts if t in (0, 1) and t != team and (p - base).flat() <= r]
+    return sorted(out, key=lambda kp: (kp[0] != "dom_turret", (kp[1] - base).flat()))
+
+
+def dominion_orders(zones, players, team, prev=None, forts=()):
+    """What each of a team's bots does in Dominion: {bot id: {kind, zone, pos, hold, clear}}.
+    zones: [(Vec, radius, owner team or -1)] (snap.obj_zones); forts: [(kind, Vec, team)] turrets and shields.
+      capture: go right next to the base (pos), hold interact `hold` seconds; `clear`: the other team's turrets and
+               shields at that base, to shoot down before going in (empty: go in)
+      defend:  stay at one of our bases (pos), turn on anyone who comes to it
+    Some defend and more attack. We hold every base: all defend; they hold every base: all attack. A bot keeps its job
+    while it is still valid (prev), so the split does not shuffle each tick."""
+    bots = [p for p in players if p.alive and p.team == team and getattr(p, "is_bot", True)]
+    if not bots or not zones:
+        return {}
+    prev = prev or {}
+    mine = [k for k, z in enumerate(zones) if z[2] == team]
+    theirs = [k for k in range(len(zones)) if k not in mine]
+    n = len(bots)
+    n_def = n if not theirs else 0 if not mine else min(DOM_DEF_PER_BASE * len(mine), int(n * DOM_DEF_SHARE), (n - 1) // 2)
+    out, left = {}, list(bots)
+
+    def order(p, kind, k):
+        pos = zones[k][0]
+        out[p.id] = dict(kind=kind, zone=k, pos=pos, hold=DOM_HOLD_S if kind == "capture" else 0.0,
+                         clear=_fort_hostile(forts, team, pos) if kind == "capture" else [])
+        left.remove(p)
+
+    # defenders: who defended and still can, then the ones nearest our bases; each to the base with fewest of ours
+    if n_def:
+        keep = [p for p in bots if prev.get(p.id, {}).get("kind") == "defend" and prev[p.id]["zone"] in mine][:n_def]
+        rest = sorted((p for p in bots if p not in keep),
+                      key=lambda p: min((p.pos - zones[k][0]).flat() for k in mine))
+        count = {k: 0 for k in mine}
+        for p in keep + rest[:n_def - len(keep)]:
+            def threat(k):
+                return sum(1 for q in players if q.alive and q.team != team and (q.pos - zones[k][0]).flat() < 10.0)
+            k = prev[p.id]["zone"] if p in keep else min(mine, key=lambda k: (count[k], -threat(k), (p.pos - zones[k][0]).flat()))
+            count[k] += 1
+            order(p, "defend", k)
+    # attackers: the rest, spread over the bases that are not ours, nearest first, no base over its share
+    if left and theirs:
+        cap = -(-len(left) // len(theirs))
+        load = {k: 0 for k in theirs}
+        for p in [p for p in left if prev.get(p.id, {}).get("kind") == "capture" and prev[p.id]["zone"] in load]:
+            k = prev[p.id]["zone"]
+            if load[k] < cap:
+                load[k] += 1
+                order(p, "capture", k)
+        for p in sorted(left, key=lambda p: min((p.pos - zones[k][0]).flat() for k in theirs)):
+            open_ = [k for k in theirs if load[k] < cap] or theirs
+            k = min(open_, key=lambda k: (p.pos - zones[k][0]).flat())
+            load[k] += 1
+            order(p, "capture", k)
+    for p in list(left):                  # nothing to attack and nobody needed to defend: hold the nearest base of ours
+        if mine:
+            order(p, "defend", min(mine, key=lambda k: (p.pos - zones[k][0]).flat()))
+    return out
+
+
 class Watch:
     """The live state of one of OBJECT_MODES for tools/live_bots.py: fills the snapshot's obj_ fields every tick."""
 
     def __init__(s, mode, objs, game="reach"):
         s.kind, s.mode, s.lay = mode, ALIAS.get(mode, mode), layout(objs, mode)   # (kind: the mode read, mode: as played)
         s.capture = CAPTURE_S.get(game, 30.0)     # (tools/live_bots.py names none: Reach's, whose territories it reads)
+        if mode == "dominion":
+            s.capture = DOM_HOLD_S                # held interact 3 s takes a base
+            s.dom_prev, s.forts, s.forts_t = {}, [], -9.0
         s.owner, s.held = {}, {}          # territories: zone index -> owner team; -> (team, since) while held alone
         s.items_t, s.items = -9.0, []
         s.stands, s.stands_t = [], -9.0
@@ -336,16 +417,16 @@ class Watch:
         named = {p.id: p.weapon for p in snap.players if p.alive and p.weapon not in (None, "", "none", "unknown")}
         if "sword" in named.values():
             # a sword in a hand by name (every game names it now; Halo 3 by the map's tag names): the name decides from
-            # here on, not the raw tag. Live Rat's Nest playtest: round 2's three zombies held a sword whose
+            # here on, not the raw tag. Live Rat's Nest, the owner's game: round 2's three zombies held a sword whose
             # tag was not round 1's zombie tag, so all 16 read survivors and the zombies stood in the holds with them
-            # (flagged: the bots were confused about their teams)
+            # (his "confused on their teams", "something is broken here")
             s.by_name = True
         if getattr(s, "by_name", False):
             tags = {}
         if not tags:
             # (Halo 4 Flood, H2A, Reach in a free for all: their readers carry no raw gun tag; the gun's name tells the
             # same, the infected's prongs or sword read "sword". Before, nothing split: every survivor fought every
-            # other, issue #3)
+            # other, owner, issue #3)
             tags = {p.id: p.weapon for p in snap.players if p.alive and p.weapon not in (None, "", "none", "unknown")}
             # by name the zombies' kind is their sword: the fewest-held rule took a survivor's sidearm (live Reach
             # Boardwalk: one sword, two shotguns, one magnum -> the magnum; Halo 4 Flood on Adrift, its opening DMRs
@@ -416,6 +497,57 @@ class Watch:
         teams = {t for _, _, t in hist}
         return next(iter(teams)) if len(teams) == 1 and teams <= {0, 1} else None
 
+    def dom_bases(s):
+        """Dominion's capture points [(Vec, radius, team)]: the dom_base terminals, else the dom_base_zone areas."""
+        return s.lay.get("dom_base") or s.lay.get("territory", [])
+
+    def dominion_update(s, live, snap, now, alive):
+        """Dominion: snap.obj_zones (a base's terminal, the use radius, its owner), snap.deployed (the turrets and shields
+        a fortified base has spawned, with the team of the base they stand at) and snap.dom_orders ({bot id: order},
+        dominion_orders). A base is a team's once it stood alone at the terminal DOM_HOLD_S (the game's owner is not read:
+        like Territories, until it is decoded); a man from the other team there too holds it contested."""
+        out = []
+        for k, (pos, _, _) in enumerate(s.dom_bases()):
+            teams = {p.team for p in alive if (p.pos - pos).flat() <= DOM_BASE_R and abs(p.pos.z - pos.z) <= DOM_BASE_DZ}
+            if len(teams) == 1:
+                t = next(iter(teams))
+                team, since = s.held.get(k, (t, now))
+                if team != t:
+                    since = now
+                s.held[k] = (t, since)
+                if now - since >= s.capture:
+                    s.owner[k] = t
+            else:
+                s.held.pop(k, None)
+            out.append((pos, DOM_USE_R, s.owner.get(k, -1)))
+        snap.obj_zones = out
+        snap.dom_labels = [pos for pos, _, _ in s.lay.get("dom_base", [])]   # the dom_base-labelled terminals (dom_base.bases)
+        if now - s.forts_t > 0.5:               # what stands at the bases: the reader's dom_objects() [(name, Vec, team or
+            s.forts_t, found = now, []          # None)] when it has one, else the objects it can find by name (loose_named)
+            for kind, names in FORT_NAMES:
+                try:
+                    if hasattr(live, "dom_objects"):
+                        found += [(kind, Vec(*q), t) for nm, q, t in live.dom_objects() if any(w in nm for w in names)]
+                    else:
+                        found += [(kind, Vec(*q), None) for w in names for q in live.loose_named(w)]
+                except Exception:
+                    pass
+            s.forts, seen = [], set()
+            for kind, q, t in found:            # a team of its own, else the owner of the base it stands at
+                if (kind, round(q.x, 1), round(q.y, 1), round(q.z, 1)) in seen:
+                    continue                    # (one object found under two of its names)
+                seen.add((kind, round(q.x, 1), round(q.y, 1), round(q.z, 1)))
+                if t not in (0, 1):
+                    near = [(( q - z[0]).flat(), z[2]) for z in out if (q - z[0]).flat() <= DOM_FORT_R]
+                    t = min(near)[1] if near else -1
+                s.forts.append((kind, q, t))
+        snap.deployed = list(getattr(snap, "deployed", [])) + [dict(kind=k, pos=q, team=t, t=now) for k, q, t in s.forts]
+        orders = {}
+        for team in (0, 1):
+            s.dom_prev[team] = dominion_orders(out, snap.players, team, s.dom_prev.get(team), s.forts)
+            orders.update(s.dom_prev[team])
+        snap.dom_orders = orders
+
     def update(s, live, snap, now, raw=None):
         snap.mode = s.mode
         if s.mode == "headhunter" and raw is not None and hasattr(live, "loose_named") and now - s.items_t > 0.25:
@@ -439,7 +571,9 @@ class Watch:
             # (the Juggernaut is told by his overshield alone: Halo 2's reader has no HUD marks)
             s.mark_special(live, snap, raw)
         alive = [p for p in snap.players if p.alive]
-        if s.mode in ("territories", "headhunter", "infection"):
+        if s.kind == "dominion":
+            s.dominion_update(live, snap, now, alive)
+        elif s.mode in ("territories", "headhunter", "infection"):
             kind = {"territories": "territory", "headhunter": "drop_point", "infection": "haven"}[s.mode]
             zones = s.lay.get(kind, [])
             out = []
@@ -469,12 +603,8 @@ class Watch:
                 s.items_t = now
                 try:
                     s.items = live.objective_items(raw, stands, s.mode)
-                except Exception as e:
+                except Exception:
                     s.items = []
-                    if not getattr(s, "items_err", None):   # (said once: it was silent, and live Boardwalk Stockpile
-                        import traceback                    # Nov 10 read no flag in 516 s while a probe read 7)
-                        s.items_err = f"{type(e).__name__}: {e}"
-                        print(f"objective items unread ({s.items_err}):", traceback.format_exc(limit=3), flush=True)
             snap.obj_items = [dict(pos=Vec(*it["pos"]), carrier=it["carrier"], kind=stand_kind,
                                    team=placed[it["stand"]][1] if it.get("stand") in stands else 8) for it in s.items]
             # Assault: a bomb with nobody carrying it in the other team's goal, off its own stand, is armed there (as
@@ -507,18 +637,17 @@ def carry_goal(mode, snap, team, pos):
     return min(goals, key=lambda g: dist(g, pos)) if goals else None
 
 
-# Infection's survivors take cover in buildings with as few entrances as possible (issue #3): holds are rooms
+# Infection's survivors "cower into buildings with as minimal entrances as possible" (owner, issue #3): holds are rooms
 # found on the nav. From each node of a HOLD_LATTICE-cell lattice the floor within HOLD_R by walk is its room; the nodes
 # at the edge of that walk are the ways out, each joined group of them an entrance (its middle a door). Kept: rooms of
-# HOLD_AREA or more, rooms people stood in first, roofed first, then the fewest entrances, then the narrowest (exposure:
-# the ways out's width).
+# HOLD_AREA or more, roofed first, then the fewest entrances, then the narrowest (exposure: the ways out's width).
 HOLD_R, HOLD_LATTICE, HOLD_AREA, HOLD_APART = 5.0, 12, 6.0, 12.0
 _HOLDS = {}                 # map name -> [hold], None while being found (holds)
 
 
 def find_holds(T, R=HOLD_R, lattice=HOLD_LATTICE):
-    """Every hold on T's nav, best first: dict(pos, entrances, exposure, area, roof, doors, walked). 0.2-4 s a map
-    (Rat's Nest 0.4 s, Reach's Breakpoint 3.8 s)."""
+    """Every hold on T's nav, best first: dict(pos, entrances, exposure, area, roof, doors). 0.2-4 s a map (Rat's Nest
+    0.4 s, Reach's Breakpoint 3.8 s)."""
     import heapq
     import numpy as np
     from scipy import ndimage
@@ -526,7 +655,6 @@ def find_holds(T, R=HOLD_R, lattice=HOLD_LATTICE):
     g, N, out = T.graph, T.nh * T.nw, []
     ip, ix, wt = g.indptr, g.indices, g.data
     reach, oob = getattr(T, "reach", None), getattr(T, "oob", None)
-    walked = getattr(T, "people_walked", None)     # (maps.terrain: LiDAR cells anyone stood on)
     for l, j, i in np.argwhere(T.lwalk):
         if j % lattice or i % lattice or T.degree[l, j, i] < 6:
             continue
@@ -559,22 +687,9 @@ def find_holds(T, R=HOLD_R, lattice=HOLD_LATTICE):
             continue                    # (a sealed pocket: nobody walks in, nobody out)
         z = float(T.lz[l, j, i])
         out.append(dict(pos=T._center(int(l), int(j), int(i)), entrances=len(doors), exposure=len(rim) * NAV_CELL,
-                        area=area, roof=bool(T.top[j * T.nstep, i * T.nstep] - z > 1.8), doors=doors,
-                        walked=not walked or any(_walked(T, walked, v) for v in best)))
-    # rooms people stood in first (a map with people's walks; the others after, a short LiDAR session misses real ones:
-    # Damnation's 316 walked cells are in 2 of its 47): a pit under a walkway, "roofed" by it, ways in only drops, came
-    # first, and three survivors pushed 35 s into the wall at its rim for posts in it (Blood Cavern flags, Nov 6:
-    # the same three bots stuck at one spot, pushing at a wall)
-    out.sort(key=lambda o: (not o["walked"], not o["roof"], o["entrances"], o["exposure"]))
+                        area=area, roof=bool(T.top[j * T.nstep, i * T.nstep] - z > 1.8), doors=doors))
+    out.sort(key=lambda o: (not o["roof"], o["entrances"], o["exposure"]))
     return out
-
-
-def _walked(T, walked, v):
-    """Did anyone stand on nav node v (people_walked keys: 0.25 u x 0.1 u, a few tenths up or down)?"""
-    l, r = divmod(int(v), T.nh * T.nw)
-    c = T._center(l, *divmod(r, T.nw))
-    k0, k1, kz = round(c.x / 0.25), round(c.y / 0.25), round(c.z / 0.1)
-    return any((k0, k1, kz + dz) in walked for dz in range(-3, 4))
 
 
 def holds(T, name, wait=False):
@@ -590,7 +705,7 @@ def holds(T, name, wait=False):
 
 
 def pick_holds(hs, k, apart=HOLD_APART):
-    """k holds for k survivor groups (separate groups in their own areas of the map): the best,
+    """k holds for k survivor groups (the owner: "split into separate groups in their own areas of the map"): the best,
     then each next best at least `apart` from those taken (closer ones if the map has too few)."""
     out = []
     for gap in (apart, apart / 2, 0.0):
