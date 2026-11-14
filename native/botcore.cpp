@@ -269,10 +269,6 @@ static void ce_own_ids() {
     }
 }
 
-void ce_ragdoll_tick();                    // ce_ragdoll.cpp
-bool ce_ragdoll_install(uint8_t* h1);
-void ce_ragdoll_folder(const wchar_t* dll_dir);
-
 static void __fastcall tick_hook(void* a, void* b, void* c, void* d) {
     g_tick_orig(a, b, c, d);
     if (!g_shm) return;
@@ -281,28 +277,6 @@ static void __fastcall tick_hook(void* a, void* b, void* c, void* d) {
     run_command();
     update_bot_units();
     ce_own_ids();
-    ce_ragdoll_tick();
-}
-
-// A player's HUD message (pickups: "picked up 4 grenades", power-ups, their sounds), FUN_180ada904(player, ...). In a
-// hosted game it goes to the player's machine as a network message; a bot's machine is made up, and the host showed
-// its pickups to the person (GitHub #21). A bot gets none.
-static const uintptr_t RVA_HUD_MESSAGE = 0xADA904;
-typedef void(__fastcall* hud_message_fn)(uint32_t player, uint8_t a, uint32_t b, uint16_t c, uint8_t d);
-static hud_message_fn g_hud_message_orig;
-static volatile long g_hud_skipped;
-
-static void __fastcall hud_message_hook(uint32_t player, uint8_t a, uint32_t b, uint16_t c, uint8_t d) {
-    if (g_shm && player != 0xFFFFFFFFu) {
-        int index = (int)(player & 0xFFFF);
-        for (int i = 0; i < HB_MAX_PLAYERS; i++)
-            if (g_shm->bot_player_index[i] == index) {
-                long n = InterlockedIncrement(&g_hud_skipped);
-                if ((n & (n - 1)) == 0) logf("ce: %ld bot HUD messages (pickups) kept off the player's screen", n);
-                return;
-            }
-    }
-    g_hud_message_orig(player, a, b, c, d);
 }
 
 static uint8_t g_patch[5];   // the jump our hook wrote: another loaded botcore's jump is not ours
@@ -312,18 +286,15 @@ static void hook(uint8_t* h1) {
         MH_RemoveHook(g_h1 + RVA_GAME_TICK);
         MH_RemoveHook(g_h1 + RVA_DEQUEUE);
         MH_RemoveHook(g_h1 + RVA_UNIT_LOCAL_PLAYER);
-        MH_RemoveHook(g_h1 + RVA_HUD_MESSAGE);
         for (int i = 0; i < HB_MAX_PLAYERS; i++) g_shm->bot_player_index[i] = -1;
     }
     g_h1 = h1;
-    ce_ragdoll_install(h1);                   // (its own hook, enabled with these; it drops the old copy's)
     void* stub = make_unit_local_stub();
     if (!stub ||
         MH_CreateHook(g_h1 + RVA_GAME_TICK, (void*)&tick_hook, (void**)&g_tick_orig) != MH_OK ||
         MH_CreateHook(g_h1 + RVA_DEQUEUE, (void*)&dequeue_hook, (void**)&g_dequeue_orig) != MH_OK ||
         MH_CreateHook(g_h1 + RVA_UNIT_LOCAL_PLAYER, stub, &g_unit_local_orig) != MH_OK ||
         !(*g_stub_orig_slot = (uint64_t)g_unit_local_orig) ||
-        MH_CreateHook(g_h1 + RVA_HUD_MESSAGE, (void*)&hud_message_hook, (void**)&g_hud_message_orig) != MH_OK ||
         MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
         logf("hooks failed at halo1 %p", g_h1);
     } else {
@@ -351,8 +322,9 @@ static DWORD g_brain_due;            // match started: start the brain when the 
 static void ini_path(wchar_t* out) { swprintf_s(out, MAX_PATH, L"%sbotcore.ini", g_dir); }
 
 hb_roster g_roster;                  // the BOTS panel's list: exactly the bots of the next match (bots_panel.h)
-hb_roster g_ff_roster;               // Reach Firefight's list: up to 7 bots, Spartan and Elite teams (botcore.ini ffbot=)
-hb_roster g_od_roster;               // ODST Firefight's: up to 7 bots, all on your team (odbot=)
+hb_roster g_ff_roster;               // Firefight's list (botcore.ini ffbot=): Reach, up to 7 bots on red and blue as in a custom
+                                     // game; ODST takes its first 3 (play.py), all on your team
+static const int FF_ROSTER_MAX = 7;  // (8 players with you, Reach's Firefight)
 uint32_t g_prejoin = 1;              // H2A, Halo 4: a match's first tick waits for the bots (native/h4f.cpp f_prejoin; botcore.ini prejoin=0: off)
 uint32_t g_collector = 0;            // the brain records the player for the Observer (collector=; tools/collector.py)
 uint32_t g_scale_games = 5;         // Scaling difficulty: the player's last games averaged (scale_games=)
@@ -391,24 +363,22 @@ void save_settings() {
                                                                                                    // dropped it)
     roster_write(f, g_roster);
     roster_write(f, g_ff_roster, "ff");
-    roster_write(f, g_od_roster, "od");
     fclose(f);
 }
 
-// Firefight's own lists, first made from the 16-player list's first 3 (never cut to fit Firefight): Reach's (8 players,
-// a Spartan and an Elite team, 4 a side: ffbot=) and ODST's (you and 7 bots, all on your team: odbot=; it was the
-// one list, Reach's too, until Nov 8: an old list seeds ODST's)
-static void ff_seed(hb_roster& r) {
-    r.n = 0; r.teams = 1;
-    for (int i = 0; i < g_roster.n && r.n < 3; i++) { r.bot[r.n] = g_roster.bot[i]; r.bot[r.n++].team = 0; }
+// Firefight's own list, first made from the list's first 7 (Reach: 8 players with you, red and blue; ODST: 4 players, the
+// first 3 and all on your team, play.py): the 16-player list is never cut to fit Firefight
+static void ff_seed() {
+    g_ff_roster.n = 0; g_ff_roster.teams = 2;
+    for (int i = 0; i < g_roster.n && g_ff_roster.n < FF_ROSTER_MAX; i++) { g_ff_roster.bot[g_ff_roster.n] = g_roster.bot[i]; g_ff_roster.bot[g_ff_roster.n++].team &= 1; }
 }
 
 static void load_settings() {
     g_shm->bots_enabled = 1; g_shm->red_players = 4; g_shm->blue_players = 4; g_shm->difficulty = 4;
     g_shm->lidar_mode = 0; g_shm->lidar_players = HB_MAX_PLAYERS;
     g_roster.n = 0; g_roster.teams = 2;
-    g_ff_roster.n = 0; g_od_roster.n = 0;
-    bool listed = false, ff_listed = false, od_listed = false;                // written by a build with the bot list (Firefight's)
+    g_ff_roster.n = 0;
+    bool listed = false, ff_listed = false;                 // written by a build with the bot list (Firefight's)
     wchar_t p[MAX_PATH]; ini_path(p);
     FILE* f = _wfopen(p, L"r");
     if (f) {
@@ -417,9 +387,7 @@ static void load_settings() {
             unsigned v;
             if (!strncmp(line, "roster=", 7)) listed = true;
             if (!strncmp(line, "ffroster=", 9)) { ff_listed = true; continue; }
-            if (!strncmp(line, "ffbot=", 6)) { if (g_ff_roster.n < 7) roster_parse_line(line + 2, g_ff_roster); continue; }
-            if (!strncmp(line, "odroster=", 9)) { od_listed = true; continue; }
-            if (!strncmp(line, "odbot=", 6)) { if (g_od_roster.n < 7) roster_parse_line(line + 2, g_od_roster); continue; }
+            if (!strncmp(line, "ffbot=", 6)) { if (g_ff_roster.n < FF_ROSTER_MAX) roster_parse_line(line + 2, g_ff_roster); continue; }
             if (roster_parse_line(line, g_roster)) continue;
             if (sscanf_s(line, "enabled=%u", &v) == 1) g_shm->bots_enabled = v != 0;
             else if (sscanf_s(line, "red=%u", &v) == 1) g_shm->red_players = v > 8 ? 8 : v;
@@ -447,22 +415,13 @@ static void load_settings() {
                              : roster_mixed_tier(g_roster.n);
                     roster_add(g_roster, t, tier, HB_STYLE_ANY, s += 7919);
                 }
-        ff_seed(g_ff_roster); ff_seed(g_od_roster); ff_listed = od_listed = true;
+        ff_seed(); ff_listed = true;
         save_settings();
         logf("bot list made from the old team sizes: %d red, %d blue", red, blue);
     }
-    if (!ff_listed) ff_seed(g_ff_roster);
-    if (!od_listed) {                                       // (from the one Firefight list of before: its first 3)
-        g_od_roster.n = 0;
-        for (int i = 0; i < g_ff_roster.n && g_od_roster.n < 3; i++) g_od_roster.bot[g_od_roster.n++] = g_ff_roster.bot[i];
-    }
-    g_ff_roster.teams = 1;                                  // (Reach's: two teams at most)
-    for (int i = 0; i < g_ff_roster.n; i++) {
-        if (g_ff_roster.bot[i].team > 1) g_ff_roster.bot[i].team = 1;
-        if (g_ff_roster.bot[i].team + 1 > g_ff_roster.teams) g_ff_roster.teams = g_ff_roster.bot[i].team + 1;
-    }
-    for (int i = 0; i < g_od_roster.n; i++) g_od_roster.bot[i].team = 0;   // (ODST's: yours)
-    g_od_roster.teams = 1;
+    if (!ff_listed) ff_seed();
+    for (int i = 0; i < g_ff_roster.n; i++) g_ff_roster.bot[i].team &= 1;      // (Firefight: red or blue, no more teams)
+    g_ff_roster.teams = 2;
     // a list saved on Scaling before it was a bot's own difficulty (s149 and before kept Mixed's on the bots): Scaling
     // for every bot, once, so the list shows what plays
     bool scaled = false;
@@ -517,7 +476,6 @@ static DWORD WINAPI main_thread(LPVOID self) {
     GetModuleFileNameW((HMODULE)self, path, MAX_PATH);
     wcscpy_s(g_dir, path);
     *(wcsrchr(g_dir, L'\\') + 1) = 0;
-    ce_ragdoll_folder(g_dir);                 // (the launcher's settings: Halo: CE ragdolls on / off)
     {   // this install's 15 bots for the BOTS panel's new names (tools/launch.py makes the file before injecting)
         wchar_t prof[MAX_PATH];
         swprintf_s(prof, L"%sbot_profiles.ini", g_dir);
@@ -560,7 +518,7 @@ static DWORD WINAPI main_thread(LPVOID self) {
         reach_watch();                        // Halo: Reach (native/reach.cpp)
         odst_watch();                         // Halo 3: ODST (native/odst.cpp)
         h4f_watch();                          // Halo 2 Anniversary, Halo 4 (native/h4f.cpp)
-        spawnhook_watch();                    // Reach respawns; no bot countdown beeps (native/spawnhook.cpp)
+        spawnhook_watch();                    // Reach: bots respawn in Invasion (native/spawnhook.cpp)
         // the brain runs while a match is on: start it when the menus give way to a game (MCC
         // does not always reload halo1.dll for a new match), stop it back in the menus
         int menu = mcc_menu_state();

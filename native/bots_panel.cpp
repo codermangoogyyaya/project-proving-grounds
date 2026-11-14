@@ -25,14 +25,13 @@
 #include "third_party/imgui/imgui.h"
 #include "third_party/imgui/imgui_internal.h"             // (SetKeyOwner: the 3D view keeps its arrow keys)
 
-// overlay.cpp: the lobby open is Firefight's. 1: ODST's (8 players: you and 7 bots, all on your team); 2: Reach's (set in
-// bots_panel by the lobby's title), MCC's custom Firefight since July 2023: 8 players in all, a Spartan team and an
-// Elite team (Versus, Generator Defense), this mod's rule 4 a side (docs/bot-brain/11-reach-firefight-versus.md 1.5)
-int hb_panel_firefight = 0;
-static const int FF_SIDE = 4;    // (Reach Firefight: players a side, you included)
-static const char* FF_FULL = "Firefight holds 8 players in all and this mod runs 4 a side: a side cannot hold more than 4.";
-static int roster_cap() { return hb_panel_firefight ? 7 : HB_ROSTER_MAX; }   // (Firefight: 8 players, you and 7 bots)
-static const char* side_name(int t) { return hb_panel_firefight == 2 ? (t == 0 ? "Spartan team" : "Elite team") : nullptr; }
+int hb_panel_firefight = 0;      // overlay.cpp: the lobby open is Firefight's (ODST: 4 players, you and 3 bots; Reach: 8)
+static int g_panel_title = 0;    // the game open (bots_panel_env.title: 5 Reach, 8 ODST), set each frame by bots_panel
+// Reach's Firefight is set up like a custom game: red and blue teams, up to 7 bots (8 players with you), and the Covenant
+// AI are blue. ODST's keeps its one team and 3 bots.
+static bool ff_one_team() { return hb_panel_firefight && g_panel_title != 5; }
+static bool ff_two_teams() { return hb_panel_firefight && g_panel_title == 5; }
+static int roster_cap() { return ff_one_team() ? 3 : hb_panel_firefight ? 7 : HB_ROSTER_MAX; }
 
 // ------------------------------------------------------------------ tables
 static const char* TEAM_NAME[HB_TEAMS_MAX] = { "Red", "Blue", "Green", "Orange", "Purple", "Gold", "Brown", "Pink" };
@@ -73,9 +72,7 @@ const char* team_name(int t) { return t >= 0 && t < HB_TEAMS_MAX ? TEAM_NAME[t] 
 const char* tier_name(int t) { return t >= 0 && t < 5 ? TIER_NAME[t] : "?"; }
 const char* tier_key(int t) { return t >= 0 && t < 5 ? TIER_KEY[t] : "top"; }
 const char* style_name(int s) { return s >= 0 && s < 8 ? STYLE_KEY[s] : "any"; }
-int roster_max_teams(int title) {   // (ODST's Firefight: yours; Reach's: Spartans and Elites)
-    return hb_panel_firefight == 2 ? 2 : hb_panel_firefight ? 1 : title == 1 ? 2 : HB_TEAMS_MAX;
-}
+int roster_max_teams(int title) { return ff_one_team() ? 1 : ff_two_teams() ? 2 : title == 1 ? 2 : HB_TEAMS_MAX; }   // (ODST Firefight: yours; Reach's: red and blue)
 
 static int key_index(const char* s, const char* const* keys, int n, int fallback) {
     for (int i = 0; i < n; i++)
@@ -167,9 +164,6 @@ static const char* EFFECTS_LEVEL[4] = { "none", "rare", "common", "frequent" }; 
 static int g_species = 1;                                // the bots' species: 0 Spartans only, 1 mixed, 2 Elites only
 static int g_elite_share = -1;                           // mixed: the percent rolled Elite (-1: each game's own mix)
 static const char* SPECIES_LEVEL[3] = { "spartans", "mixed", "elites" };   // brain/looks.py elite_share
-static int g_odst_helm = 1;                              // ODST helmets: 0 on, 1 mixed, 2 off (brain/looks.py helmet_share)
-static int g_odst_off = -1;                              // mixed: the percent rolled helmet off (-1: each character's odds)
-static const char* HELM_LEVEL[3] = { "on", "mixed", "off" };
 
 int profiles_count() { return g_nprof; }
 const char* profile_name(int i) { return i >= 0 && i < g_nprof ? g_prof[i] : ""; }
@@ -178,8 +172,6 @@ int profiles_experience() { return g_experience; }
 int profiles_effects() { return g_effects; }
 int profiles_species() { return g_species; }
 int profiles_elite_share() { return g_elite_share; }
-int profiles_odst_helmets() { return g_odst_helm; }
-int profiles_odst_off() { return g_odst_off; }
 
 static int effects_level(const char* v) {                // a level name; the first files said 0 (off) or 1 (on)
     for (int k = 0; k < 4; k++) if (_stricmp(v, EFFECTS_LEVEL[k]) == 0) return k;
@@ -194,8 +186,6 @@ void bots_panel_profiles(const wchar_t* path) {
     g_effects = 0;
     g_species = 1;
     g_elite_share = -1;
-    g_odst_helm = 1;
-    g_odst_off = -1;
     if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
     char line[512];
     while (g_nprof < 32 && fgets(line, sizeof line, f)) {
@@ -207,11 +197,6 @@ void bots_panel_profiles(const wchar_t* path) {
             continue;
         }
         if (strncmp(line, "elites=", 7) == 0) { g_elite_share = atoi(line + 7) > 100 ? 100 : atoi(line + 7); continue; }
-        if (strncmp(line, "odst_helmets_off=", 17) == 0) { g_odst_off = atoi(line + 17) > 100 ? 100 : atoi(line + 17); continue; }
-        if (strncmp(line, "odst_helmets=", 13) == 0) {
-            for (int k = 0; k < 3; k++) if (_stricmp(line + 13, HELM_LEVEL[k]) == 0) g_odst_helm = k;
-            continue;
-        }
         if (strncmp(line, "bot=", 4) != 0) continue;
         char* name = line + 4;
         char* comma = strchr(name, ',');                     // <name>,<seed>[,<clan>[,<overrides>]]: no commas in names
@@ -246,8 +231,6 @@ bool profiles_save() {
     fprintf(f, "experience=%s\neffects=%s\n", g_experience ? "modern" : "original", EFFECTS_LEVEL[g_effects & 3]);
     fprintf(f, "species=%s\n", SPECIES_LEVEL[g_species >= 0 && g_species < 3 ? g_species : 1]);
     if (g_elite_share >= 0) fprintf(f, "elites=%d\n", g_elite_share);
-    fprintf(f, "odst_helmets=%s\n", HELM_LEVEL[g_odst_helm >= 0 && g_odst_helm < 3 ? g_odst_helm : 1]);
-    if (g_odst_helm == 1 && g_odst_off >= 0) fprintf(f, "odst_helmets_off=%d\n", g_odst_off);
     for (int i = 0; i < g_nprof; i++) {
         if (g_prof_over[i][0]) fprintf(f, "bot=%s,%u,%s,%s\n", g_prof[i], g_prof_seed[i], g_prof_clan[i], g_prof_over[i]);
         else fprintf(f, "bot=%s,%u,%s\n", g_prof[i], g_prof_seed[i], g_prof_clan[i]);
@@ -551,8 +534,7 @@ static void made_clan(char* t, uint32_t& s) {
     t[n] = 0;
 }
 
-bool profiles_reroll(const wchar_t* path, int experience, int effects, uint32_t seed, int species, int elite_share,
-                     int odst_helm, int odst_off) {
+bool profiles_reroll(const wchar_t* path, int experience, int effects, uint32_t seed, int species, int elite_share) {
     uint32_t s = seed | 1;
     char names[15][16];
     for (int i = 0; i < 15; i++) {
@@ -573,8 +555,6 @@ bool profiles_reroll(const wchar_t* path, int experience, int effects, uint32_t 
     fprintf(f, "experience=%s\neffects=%s\n", experience ? "modern" : "original", EFFECTS_LEVEL[effects >= 0 && effects < 4 ? effects : 0]);
     fprintf(f, "species=%s\n", SPECIES_LEVEL[species >= 0 && species < 3 ? species : 1]);
     if (species == 1 && elite_share >= 0) fprintf(f, "elites=%d\n", elite_share > 100 ? 100 : elite_share);
-    fprintf(f, "odst_helmets=%s\n", HELM_LEVEL[odst_helm >= 0 && odst_helm < 3 ? odst_helm : 1]);
-    if (odst_helm == 1 && odst_off >= 0) fprintf(f, "odst_helmets_off=%d\n", odst_off > 100 ? 100 : odst_off);
     for (int i = 0; i < 15; i++) {
         uint32_t look = rnd(s) & 0x7FFFFFFF;
         const char* clan = rint(s, 100) < 55 ? clans[rint(s, nclans)] : "";
@@ -608,7 +588,6 @@ int roster_on_team(const hb_roster& r, int team) {
 
 bool roster_add(hb_roster& r, int team, int tier, int style, uint32_t seed) {
     if (r.n >= roster_cap()) return false;
-    if (hb_panel_firefight == 2 && (team > 1 || roster_on_team(r, team) >= FF_SIDE)) return false;
     hb_bot& b = r.bot[r.n];
     b.team = (uint8_t)team; b.tier = (uint8_t)tier; b.style = (uint8_t)style;
     r.n++;
@@ -630,12 +609,10 @@ static int mixed_tier(int k) { return roster_mixed_tier(k); }
 void roster_fill(hb_roster& r, int teams, int per_team, int tier, int style, uint32_t seed) {
     uint32_t s = seed | 1;
     r.n = 0;
-    r.teams = hb_panel_firefight == 2 ? 2 : hb_panel_firefight ? 1 : teams < 2 ? 2 : teams > HB_TEAMS_MAX ? HB_TEAMS_MAX : teams;
+    r.teams = ff_one_team() ? 1 : ff_two_teams() ? 2 : teams < 2 ? 2 : teams > HB_TEAMS_MAX ? HB_TEAMS_MAX : teams;
     for (int k = 0; k < per_team && r.n < roster_cap(); k++)          // team by team, a row at a time:
-        for (int k2 = 0; k2 < r.teams && r.n < roster_cap(); k2++) {  // the cap cuts every team evenly (Reach
-            int t = hb_panel_firefight == 2 ? r.teams - 1 - k2 : k2;  // Firefight: the Elites first, the 8th
-            roster_add(r, t, tier == 4 ? mixed_tier(r.n) : tier == 5 ? 4 : tier, style, rnd(s));   // seat is yours)
-        }
+        for (int t = 0; t < r.teams && r.n < roster_cap(); t++)       // the cap cuts every team evenly
+            roster_add(r, t, tier == 4 ? mixed_tier(r.n) : tier == 5 ? 4 : tier, style, rnd(s));
 }
 
 void roster_balance(hb_roster& r) {
@@ -885,7 +862,6 @@ void bots_panel_debug(int select, const char* popup) { g_sel = select; g_open_po
 
 static void move_bot(hb_roster& r, int i, int team) {
     if (i < 0 || i >= r.n || team < 0 || team >= HB_TEAMS_MAX) return;
-    if (hb_panel_firefight == 2 && r.bot[i].team != team && (team > 1 || roster_on_team(r, team) >= FF_SIDE)) return;
     r.bot[i].team = (uint8_t)team;
     if (team + 1 > r.teams) r.teams = team + 1;
 }
@@ -917,10 +893,10 @@ static void bot_row(bots_panel_env& e, int i, float w, bool& changed) {
     if (ImGui::BeginPopupContextItem("row")) {               // right-click: the same actions by menu
         g_sel = i;
         push(BODY);
-        if (hb_panel_firefight != 1 && ImGui::BeginMenu("Move to")) {   // (ODST's Firefight: one team)
+        if (!ff_one_team() && ImGui::BeginMenu("Move to")) {   // (ODST Firefight: one team)
             for (int t = 0; t < roster_max_teams(e.title); t++) {
                 ImGui::PushStyleColor(ImGuiCol_Text, v4(TEAM_COL[t]));
-                if (ImGui::MenuItem(side_name(t) ? side_name(t) : TEAM_NAME[t], nullptr, b.team == t)) { move_bot(r, i, t); changed = true; }
+                if (ImGui::MenuItem(TEAM_NAME[t], nullptr, b.team == t)) { move_bot(r, i, t); changed = true; }
                 ImGui::PopStyleColor();
             }
             ImGui::EndMenu();
@@ -979,14 +955,13 @@ static void team_card(bots_panel_env& e, int t, ImVec2 size, bool& changed) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), SURF);
     dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y), LINE);
-    bool one = hb_panel_firefight == 1;                      // (ODST's Firefight: your side, not Red)
-    dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + px(4)), one ? ACCENT : TEAM_COL[t]);
+    dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + px(4)), ff_one_team() ? ACCENT : TEAM_COL[t]);   // (ODST Firefight: your side, not Red)
     bool folded = t >= roster_max_teams(e.title);            // Halo: CE: green and up play as red / blue
     // header: name, count, remove (the last team, when empty)
     push(BODY);
-    char head[48]; sprintf_s(head, "%s", one ? "Your team" : side_name(t) ? side_name(t) : TEAM_NAME[t]);
+    char head[48]; sprintf_s(head, "%s", ff_one_team() ? "Your team" : TEAM_NAME[t]);
     for (char* c = head; *c; c++) *c = (char)toupper((unsigned char)*c);
-    dl->AddText(ImVec2(p.x + px(14), p.y + px(14)), one ? ACCENT : TEAM_COL[t], head);
+    dl->AddText(ImVec2(p.x + px(14), p.y + px(14)), ff_one_team() ? ACCENT : TEAM_COL[t], head);
     pop();
     int n = roster_on_team(r, t);
     push(SMALL);
@@ -1027,16 +1002,12 @@ static void team_card(bots_panel_env& e, int t, ImVec2 size, bool& changed) {
         ImGui::EndDragDropTarget();
     }
     ImGui::SetCursorScreenPos(ImVec2(p.x + px(8), p.y + size.y - add_h - px(4)));
-    bool side_full = hb_panel_firefight == 2 && n >= FF_SIDE;
-    ImGui::BeginDisabled(r.n >= roster_cap() || side_full);
+    ImGui::BeginDisabled(r.n >= roster_cap());
     char add[32]; sprintf_s(add, "+  Add bot##add%d", t);
     if (button(add, GHOST, ImVec2(size.x - px(16), add_h), true)) {
         int tier = *e.difficulty < 4 ? (int)*e.difficulty : *e.difficulty == 5 ? 4 : mixed_tier(r.n);
         if (roster_add(r, t, tier, HB_STYLE_ANY, seed())) { g_sel = r.n - 1; changed = true; }
     }
-    if (hb_panel_firefight == 2 && (side_full || r.n >= roster_cap()) &&
-        ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_ForTooltip))
-        ImGui::SetTooltip("%s", FF_FULL);
     ImGui::EndDisabled();
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + size.y));
     ImGui::PopID();
@@ -1175,18 +1146,11 @@ static void inspector(bots_panel_env& e, bool& changed) {
     if (g_sel < 0 || g_sel >= r.n) {
         caption("Selected bot");
         ImGui::Dummy(ImVec2(0, px(8)));
-        if (hb_panel_firefight == 1) {                       // (ODST's Firefight: one team, yours)
+        if (ff_one_team()) {                                 // (ODST Firefight: one team, yours)
             muted("Pick a bot to change its difficulty or play style. Names, clan tags and armor are in Settings.");
             ImGui::Dummy(ImVec2(0, px(12)));
-            muted("Firefight holds 8 players: you and up to 7 bots, all on your team. "
+            muted("Firefight holds 4 players: you and up to 3 bots, all on your team. "
                   "Right-click a bot for more; Del removes the picked one.");
-            return;
-        }
-        if (hb_panel_firefight == 2) {
-            muted("Pick a bot to change its team, difficulty or play style. Names, clan tags and armor are in Settings.");
-            ImGui::Dummy(ImVec2(0, px(12)));
-            muted("Firefight holds 8 players: a Spartan team and an Elite team of up to 4 each, you included. "
-                  "Elites fight beside the Covenant. In Versus and Generator Defense the teams swap sides each turn.");
             return;
         }
         muted("Pick a bot to change its team, difficulty or play style. Names, clan tags and armor are in Settings.");
@@ -1209,11 +1173,11 @@ static void inspector(bots_panel_env& e, bool& changed) {
     ImGui::TextUnformatted(b.name);
     pop();
     ImGui::Dummy(ImVec2(0, px(6)));
-    if (hb_panel_firefight != 1) {                           // (ODST's Firefight: every bot on your team, no picker)
+    if (!ff_one_team()) {                                    // (ODST Firefight: every bot on your team, no picker)
     caption("Team");
     int maxt = roster_max_teams(e.title);
     float chip = px(30), gap = px(6);
-    for (int t = 0; t < (hb_panel_firefight == 2 ? 2 : HB_TEAMS_MAX); t++) {   // (Reach Firefight: its two)
+    for (int t = 0; t < HB_TEAMS_MAX; t++) {
         if (t) ImGui::SameLine(0, gap);
         ImGui::PushID(t);
         ImVec2 p = ImGui::GetCursorScreenPos();
@@ -1224,14 +1188,14 @@ static void inspector(bots_panel_env& e, bool& changed) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->AddRectFilled(p, ImVec2(p.x + chip, p.y + chip), t >= maxt ? alpha(TEAM_COL[t], 0.25f) : TEAM_COL[t], px(2));
         if (b.team == t) dl->AddRect(ImVec2(p.x - 3, p.y - 3), ImVec2(p.x + chip + 3, p.y + chip + 3), GOLD, px(3), 0, 2.0f);
-        if (hov) ImGui::SetTooltip(t >= maxt ? "%s: Halo: CE has two teams" : "%s", side_name(t) ? side_name(t) : TEAM_NAME[t]);
+        if (hov) ImGui::SetTooltip(t >= maxt ? "%s: Halo: CE has two teams" : "%s", TEAM_NAME[t]);
         ImGui::PopID();
     }
     ImGui::SameLine(0, px(12));                              // the team's name beside its chips
     push(SMALL);
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (chip - ImGui::GetFontSize()) * 0.5f);
     ImGui::PushStyleColor(ImGuiCol_Text, v4(TEAM_COL[b.team < HB_TEAMS_MAX ? b.team : 0]));
-    ImGui::TextUnformatted(side_name(b.team) ? side_name(b.team) : TEAM_NAME[b.team < HB_TEAMS_MAX ? b.team : 0]);
+    ImGui::TextUnformatted(TEAM_NAME[b.team < HB_TEAMS_MAX ? b.team : 0]);
     ImGui::PopStyleColor();
     pop();
     }
@@ -1290,12 +1254,13 @@ static void quick_setup(bots_panel_env& e, bool& changed) {
     push(TITLE);
     ImGui::TextUnformatted("Quick setup");
     pop();
-    muted(hb_panel_firefight == 1 ? "Makes a new list of bots for Firefight. They all fight on your team."
-          : hb_panel_firefight == 2 ? "Makes a new list of bots for Firefight: a Spartan team and an Elite team."
-                                    : "Makes a new list of bots. You pick your own team in the lobby.");
+    muted(ff_one_team() ? "Makes a new list of bots for Firefight. They all fight on your team."
+          : ff_two_teams() ? "Makes a new list of bots for Firefight, on the red and blue teams. The Covenant AI are blue."
+                           : "Makes a new list of bots. You pick your own team in the lobby.");
     line(16);
     int maxt = roster_max_teams(e.title);
-    if (hb_panel_firefight) qs_teams = hb_panel_firefight == 2 ? 2 : 1;
+    if (ff_one_team()) qs_teams = 1;
+    else if (ff_two_teams()) qs_teams = 2;
     else {
         caption("Teams");
         static const char* TN[7] = { "2", "3", "4", "5", "6", "7", "8" };
@@ -1304,8 +1269,8 @@ static void quick_setup(bots_panel_env& e, bool& changed) {
         if (maxt == 2) muted("Halo: CE team games have two teams.");
         ImGui::Dummy(ImVec2(0, px(4)));
     }
-    caption(hb_panel_firefight == 1 ? "Bots" : "Bots on each team");
-    int most = hb_panel_firefight == 1 ? roster_cap() : hb_panel_firefight == 2 ? FF_SIDE : roster_cap() / qs_teams;
+    caption(ff_one_team() ? "Bots" : "Bots on each team");
+    int most = ff_one_team() ? roster_cap() : (roster_cap() + qs_teams - 1) / qs_teams;   // (ODST Firefight: one team, yours; Reach's 7 split 4 + 3)
     if (qs_per > most) qs_per = most;
     stepper("per", &qs_per, 1, most, qs_per == 1 ? "bot" : "bots");
     ImGui::Dummy(ImVec2(0, px(4)));
@@ -1341,13 +1306,11 @@ static void quick_setup(bots_panel_env& e, bool& changed) {
     ImGui::PopStyleColor(7);
     pop();
     line(18);
-    int total = qs_per * qs_teams < roster_cap() ? qs_per * qs_teams : roster_cap();
-    char what[200];
-    if (hb_panel_firefight == 1) sprintf_s(what, "%d %s on your team.%s", total, total == 1 ? "bot" : "bots",
-                                           r.n ? " Replaces the list you have now." : "");
-    else if (hb_panel_firefight == 2)                        // (8 in all: the 8th seat is yours)
-        sprintf_s(what, "%d Spartan %s and %d Elite %s.%s", total - qs_per, total - qs_per == 1 ? "bot" : "bots",
-                  qs_per, qs_per == 1 ? "bot" : "bots", r.n ? " Replaces the list you have now." : "");
+    int total = qs_per * qs_teams;
+    if (total > roster_cap()) total = roster_cap();             // (Reach's Firefight: 7 bots at most, the cap cuts the teams evenly)
+    char what[160];
+    if (ff_one_team()) sprintf_s(what, "%d %s on your team.%s", total, total == 1 ? "bot" : "bots",
+                                 r.n ? " Replaces the list you have now." : "");
     else sprintf_s(what, "%d bots: %d on each of %d teams.%s", total, qs_per, qs_teams,
                    r.n ? " Replaces the list you have now." : "");
     push(BODY);
@@ -1382,8 +1345,6 @@ static int rr_experience = 0;                            // the re-roll dialog's
 static int rr_effects = 0;                               // 0 none, 1 rare, 2 common, 3 frequent
 static int rr_species = 1;                               // 0 Spartans only, 1 mixed, 2 Elites only
 static int rr_elite_share = 20;                          // mixed: the percent of bots rolled Elite (the games' own: 20-30)
-static int rr_odst_helm = 1;                             // ODST helmets: 0 on, 1 mixed, 2 off
-static int rr_odst_off = 35;                             // mixed: the percent rolled helmet off (odst.json's own odds)
 static bool rr_failed = false;                           // the last re-roll could not write the file
 void bots_panel_debug_reroll_failed(bool f) { rr_failed = f; }   // native/panel_preview.cpp
 static const char* FX_NAME[4] = { "None", "Rare", "Common", "Frequent" };   // EFFECTS_LEVEL, as the menu says it
@@ -1461,42 +1422,6 @@ static void reroll_dialog(bots_panel_env& e, bool& changed) {
           rr_species == 2 ? "Every bot is an Elite in Halo 2, Halo 3, Halo: Reach and Halo 2: Anniversary. Halo: CE and "
                             "Halo 4 bots are always Spartans."
                           : "Halo: CE and Halo 4 bots are always Spartans.");
-    ImGui::Dummy(ImVec2(0, px(6)));
-    // ODST's helmets: brain/looks.py helmet_share (the characters with the choice: the squad but the Rookie and Johnson,
-    // and Dare)
-    caption("ODST helmets");
-    static const char* HLN[3] = { "Helmets on", "Mixed", "Helmets off" };
-    segmented("odsthelm", HLN, 3, &rr_odst_helm, W);
-    if (rr_odst_helm == 1) {
-        ImGui::Dummy(ImVec2(0, px(2)));
-        push(SMALL);
-        ImGui::PushStyleColor(ImGuiCol_Text, v4(TEXT2));
-        ImGui::TextUnformatted("More helmets on");
-        const char* rt = "More helmets off";
-        ImGui::SameLine(W - ImGui::CalcTextSize(rt).x);
-        ImGui::TextUnformatted(rt);
-        ImGui::PopStyleColor();
-        pop();
-        push(BODY);
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, v4(SURF2));
-        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, v4(HOVER));
-        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, v4(HOVER));
-        ImGui::PushStyleColor(ImGuiCol_SliderGrab, v4(ACCENT));
-        ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, v4(IM_COL32(150, 218, 255, 255)));
-        ImGui::PushStyleColor(ImGuiCol_Border, v4(LINE));
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, px(18));
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(px(8), px(8)));
-        ImGui::SetNextItemWidth(W);
-        char fmt[48];
-        sprintf_s(fmt, "%d%%%% helmets off, %d%%%% on", rr_odst_off, 100 - rr_odst_off);
-        if (ImGui::SliderInt("##odstoff", &rr_odst_off, 0, 100, fmt, ImGuiSliderFlags_AlwaysClamp))
-            rr_odst_off = (rr_odst_off + 2) / 5 * 5;         // (in steps of 5)
-        ImGui::PopStyleVar(3);
-        ImGui::PopStyleColor(6);
-        pop();
-    }
-    muted("The Rookie always wears his helmet and Sgt. Johnson never wears one.");
     line(18);
     push(BODY);
     ImGui::PushStyleColor(ImGuiCol_Text, v4(GOLD));
@@ -1518,8 +1443,7 @@ static void reroll_dialog(bots_panel_env& e, bool& changed) {
     }
     ImGui::SameLine(0, px(10));
     if (button("Re-roll", PRIMARY, ImVec2(bw, px(44)))) {
-        rr_failed = !profiles_reroll(g_prof_path, rr_experience, rr_effects, seed(), rr_species, rr_elite_share,
-                                     rr_odst_helm, rr_odst_off);
+        rr_failed = !profiles_reroll(g_prof_path, rr_experience, rr_effects, seed(), rr_species, rr_elite_share);
         if (!rr_failed) {
             roster_rename_all(r, seed());
             changed = true;
@@ -1755,20 +1679,9 @@ static const piece SPECIES[] = { {0, "Spartan"}, {1, "Elite"} };
 
 struct ed_game { const char* key; const char* name; const char* art; bool species; };
 // the games down the left: the logo (native/bin/art, tools/panel_art.py) and the title
-static const int ED_N = 7;
-static const ed_game ED_GAMES[ED_N] = { {"ce", "Halo: Combat Evolved", "ce", false}, {"h2", "Halo 2", "h2", true},
+static const ed_game ED_GAMES[6] = { {"ce", "Halo: Combat Evolved", "ce", false}, {"h2", "Halo 2", "h2", true},
     {"h3", "Halo 3", "h3", true}, {"reach", "Halo: Reach", "reach", true}, {"h2a", "Halo 2: Anniversary", "h2a", true},
-    {"h4", "Halo 4", "h4", false}, {"odst", "Halo 3: ODST", "odst", false} };   // (ODST: GitHub #15)
-// Halo 3: ODST's Firefight characters (maps/_looks/odst.json +0x49): the 2009 seven (Dare her own body, +0x3C), then
-// MCC's two (Modern only)
-static const int ODST_CHAR_ORIGINAL = 7;
-static const piece ODST_CHAR[] = { {0, "The Rookie"}, {1, "Mickey"}, {2, "Dutch"}, {3, "Romeo"}, {4, "Buck"},
-    {5, "Sgt. Johnson"}, {8, "Dare"}, {6, "Bug-splattered Buck"}, {7, "Injured Romeo"} };
-static const char* odst_char_name(int v) {
-    for (const piece& p : ODST_CHAR) if (p.v == v) return p.name;
-    return "ODST";
-}
-static const piece ODST_HELMET[] = { {0, "Helmet on"}, {1, "Helmet off"} };
+    {"h4", "Halo 4", "h4", false} };
 static int g_edit = -1;                                  // the profile being viewed
 static int g_edit_game = 2;                              // ED_GAMES index
 static int g_edit_view = -1;                             // Reach: the species shown (-1 its preferred one)
@@ -1927,9 +1840,7 @@ static ImVec4 h3_rgb(int i) { return pal_rgb(H3_COL, 30, i); }
 static unsigned long long ed_model(bots_panel_env* e, int G, int sp, float yaw, int w, int h) {
     if (!e || !e->render_model || !e->model_has) return 0;
     wchar_t path_rel[64];
-    // (ODST's Dare, character 8, is her own body: models/odst_dare.mdl)
-    swprintf_s(path_rel, L"models\\%S_%S.mdl", ED_GAMES[G].key,
-               G == 6 && ed_value(G, "character") == 8 ? "dare" : sp == 1 ? "elite" : "spartan");
+    swprintf_s(path_rel, L"models\\%S_%S.mdl", ED_GAMES[G].key, sp == 1 ? "elite" : "spartan");
     wchar_t path[300];
     bin_file(path, 300, path_rel);
     if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {   // beside the program (the preview)
@@ -1947,7 +1858,6 @@ static unsigned long long ed_model(bots_panel_env* e, int G, int sp, float yaw, 
     ImVec4 pri, sec, det;
     if (G == 0) pri = sec = det = pal_rgb(CE_COL, 18, ed_value(G, "color"));
     else if (G == 1) { pri = pal_rgb(H2_COL, 18, ed_value(G, "primary")); sec = det = pal_rgb(H2_COL, 18, ed_value(G, "secondary")); }
-    else if (G == 6) { pri = h3_rgb(ed_value(G, "primary")); sec = det = h3_rgb(ed_value(G, "secondary")); }   // (ODST: Halo 3's)
     else if (G >= 3) {                                       // (H2A's 30 are Halo 4's: MCC lists them in linear light)
         const swatch* P = G == 3 ? REACH_COL : H4_COL;
         pri = pal_rgb(P, 30, ed_value(G, "primary")); sec = det = pal_rgb(P, 30, ed_value(G, "secondary"));
@@ -2221,8 +2131,7 @@ static void ed_preview(ImVec2 p0, ImVec2 size, int G, bool& dirty) {
                                     IM_COL32(6, 14, 22, 255));
     }
     ImVec4 frame = G == 0 ? pal_rgb(CE_COL, 18, ed_value(G, "color")) : G == 1 ? pal_rgb(H2_COL, 18, ed_value(G, "primary"))
-                 : G == 3 ? pal_rgb(REACH_COL, 30, ed_value(G, "primary")) : G == 6 ? h3_rgb(ed_value(G, "primary"))
-                 : G >= 4 ? pal_rgb(H4_COL, 30, ed_value(G, "primary"))
+                 : G == 3 ? pal_rgb(REACH_COL, 30, ed_value(G, "primary")) : G >= 4 ? pal_rgb(H4_COL, 30, ed_value(G, "primary"))
                  : h3_rgb(ed_value(G, "primary"));
     frame.w = 1.0f;
     ImU32 fc = ImGui::ColorConvertFloat4ToU32(frame);
@@ -2301,11 +2210,7 @@ static void ed_preview(ImVec2 p0, ImVec2 size, int G, bool& dirty) {
     char head[48];
     int pref = G == 3 ? (ed_over(g, "species") >= 0 ? ed_over(g, "species") : look_get(g_prof[g_edit], g, false, "species")) : sp;
     if (ED_GAMES[G].species) sprintf_s(head, "%s%s", sp == 1 ? "ELITE" : "SPARTAN", G == 3 && sp == pref ? "  -  PREFERRED" : "");
-    else if (G == 6) {                                       // ODST: the character it plays
-        int ch = ed_value(G, "character");
-        sprintf_s(head, "%s", odst_char_name(ch));
-        for (char* c = head; *c; c++) *c = (char)toupper((unsigned char)*c);
-    } else strcpy_s(head, "SPARTAN");
+    else strcpy_s(head, "SPARTAN");
     dl->AddText(ImVec2(p0.x + pad, p0.y + px(18)), TEXT2, head);
     pop();
     if (G == 3) {
@@ -2402,9 +2307,9 @@ static void bot_editor(bots_panel_env& e, bool& changed) {
     float foot = px(64), bh = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y - body.y - foot - px(16);
     float lw = px(236);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    for (int k = 0; k < ED_N; k++) {
-        ImVec2 p(body.x, body.y + k * (bh / ED_N));
-        ImVec2 sz(lw, bh / ED_N - px(6));
+    for (int k = 0; k < 6; k++) {
+        ImVec2 p(body.x, body.y + k * (bh / 6));
+        ImVec2 sz(lw, bh / 6 - px(6));
         ImGui::SetCursorScreenPos(p);
         ImGui::PushID(k);
         if (g_game_to == k) { ImGui::SetKeyboardFocusHere(); g_game_to = -1; }
@@ -2414,9 +2319,9 @@ static void bot_editor(bots_panel_env& e, bool& changed) {
             static const ImGuiKey DOWN[] = { ImGuiKey_DownArrow, ImGuiKey_GamepadDpadDown, ImGuiKey_GamepadLStickDown };
             for (int d = 0; d < 3; d++) {                    // picker in line with the chosen game); its ends let go
                 if (k > 0) ImGui::SetKeyOwner(UP[d], ImGui::GetItemID());
-                if (k < ED_N - 1) ImGui::SetKeyOwner(DOWN[d], ImGui::GetItemID());
+                if (k < 5) ImGui::SetKeyOwner(DOWN[d], ImGui::GetItemID());
                 if (k > 0 && ImGui::IsKeyPressed(UP[d])) g_game_to = k - 1;
-                if (k < ED_N - 1 && ImGui::IsKeyPressed(DOWN[d])) g_game_to = k + 1;
+                if (k < 5 && ImGui::IsKeyPressed(DOWN[d])) g_game_to = k + 1;
             }
         }
         bool hov = ImGui::IsItemHovered(), on = g_edit_game == k, foc = focus_shown();
@@ -2446,8 +2351,8 @@ static void bot_editor(bots_panel_env& e, bool& changed) {
         pop();
     }
     if (ImGui::GetFrameCount() - g_list_frame > 1) {         // the pad's shoulders: the game before / after (no list open)
-        if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) g_edit_game = (g_edit_game + ED_N - 1) % ED_N, g_edit_view = -1;
-        if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) g_edit_game = (g_edit_game + 1) % ED_N, g_edit_view = -1;
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) g_edit_game = (g_edit_game + 5) % 6, g_edit_view = -1;
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) g_edit_game = (g_edit_game + 1) % 6, g_edit_view = -1;
     }
     int G = g_edit_game;
     const char* g = ED_GAMES[G].key;
@@ -2489,14 +2394,6 @@ static void bot_editor(bots_panel_env& e, bool& changed) {
     if (G == 1) {
         ed_colors("Primary color", G, "primary", H2_COL, 18, w, dirty);
         ed_colors("Secondary color", G, "secondary", H2_COL, 18, w, dirty);
-    }
-    if (G == 6) {                                            // Halo 3: ODST: a Firefight character, its helmet, two
-        int ch = ed_value(G, "character");                   // colours (the Rookie always wears it, Johnson never)
-        ed_pieces("Character", G, "character", ODST_CHAR, g_experience ? COUNT(ODST_CHAR) : ODST_CHAR_ORIGINAL, w, dirty);
-        if (ch != 0 && ch != 5) ed_pieces("Helmet", G, "helmet_off", ODST_HELMET, 2, w, dirty);
-        else muted(ch == 0 ? "The Rookie always wears the helmet." : "Sgt. Johnson wears no helmet.");
-        ed_colors("Primary color", G, "primary", H3_COL, 30, w, dirty);
-        ed_colors("Secondary color", G, "secondary", H3_COL, 30, w, dirty);
     }
     if (G == 2) {
         bool elite = ed_species(G) == 1;
@@ -2973,8 +2870,6 @@ static void mod_settings(bots_panel_env& e, bool& changed, ImVec2 body0, float w
     if (profiles_species() != 1) ImGui::Text("Species: %s", profiles_species() == 0 ? "Spartans only" : "Elites only");
     else if (profiles_elite_share() >= 0) ImGui::Text("Species: mixed, %d%% Elites", profiles_elite_share());
     else ImGui::TextUnformatted("Species: mixed");
-    if (profiles_odst_helmets() != 1) ImGui::Text("ODST helmets: %s", profiles_odst_helmets() == 0 ? "on" : "off");
-    else if (profiles_odst_off() >= 0) ImGui::Text("ODST helmets: mixed, %d%% off", profiles_odst_off());
     pop();
     ImGui::Dummy(ImVec2(0, px(10)));
     if (button("Re-roll profiles...", PRIMARY, ImVec2(px(240), px(46)))) {
@@ -2982,8 +2877,6 @@ static void mod_settings(bots_panel_env& e, bool& changed, ImVec2 body0, float w
         rr_effects = profiles_effects();
         rr_species = profiles_species();
         rr_elite_share = profiles_elite_share() >= 0 ? profiles_elite_share() : 20;
-        rr_odst_helm = profiles_odst_helmets();
-        rr_odst_off = profiles_odst_off() >= 0 ? profiles_odst_off() : 35;
         ImGui::OpenPopup("Re-roll bot profiles");
     }
     if (e.sounds) {                                          // the panel's sounds: their volume, 0 off
@@ -3093,10 +2986,9 @@ bool bots_panel(bots_panel_env& e) {
     g_make_texture = e.make_texture;
     g_env = &e;
     hb_roster& r = *e.roster;
-    if (hb_panel_firefight)                                  // the lobby's title decides the Firefight: Reach's two sides
-        hb_panel_firefight = e.title == 5 ? 2 : 1;
-    if (hb_panel_firefight == 1) { r.teams = 1; for (int i = 0; i < r.n; i++) r.bot[i].team = 0; }   // (yours)
-    else if (hb_panel_firefight == 2) { r.teams = 2; for (int i = 0; i < r.n; i++) if (r.bot[i].team > 1) r.bot[i].team = 1; }
+    g_panel_title = e.title;
+    if (ff_one_team()) { r.teams = 1; for (int i = 0; i < r.n; i++) r.bot[i].team = 0; }   // (ODST Firefight: yours)
+    else if (ff_two_teams()) { r.teams = 2; for (int i = 0; i < r.n; i++) r.bot[i].team &= 1; }   // (Reach Firefight: red or blue)
     else if (r.teams < 2) r.teams = 2;
     if (r.teams > HB_TEAMS_MAX) r.teams = HB_TEAMS_MAX;
     for (int i = 0; i < r.n; i++)
@@ -3199,7 +3091,7 @@ bool bots_panel(bots_panel_env& e) {
             ImGui::OpenPopup("Quick setup");
         }
         ImGui::SameLine(0, px(14));
-        if (hb_panel_firefight != 1) {                      // (ODST's Firefight: one team, nothing to balance)
+        if (!ff_one_team()) {                               // (ODST Firefight: one team, nothing to balance)
             ImGui::BeginDisabled(r.n < 2);
             if (button("Balance teams", GHOST, ImVec2(0, 0), true)) { roster_balance(r); changed = true; }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_ForTooltip)) ImGui::SetTooltip("Even out the team sizes");
@@ -3280,15 +3172,15 @@ bool bots_panel(bots_panel_env& e) {
         dl->AddText(ImVec2(body0.x + (grid_w - ts.x) * 0.5f, body0.y + body_h * 0.36f), TEXT, t1);
         pop();
         push(BODY);
-        const char* t2 = hb_panel_firefight == 1 ? "Choose up to 7 bots for your team, and how hard they play."
-                       : hb_panel_firefight == 2 ? "Choose bots for the Spartan and Elite teams, and how hard they play."
-                                            : "Choose how many teams and bots, and how hard they play.";
+        const char* t2 = ff_one_team() ? "Choose up to 3 bots for your team, and how hard they play."
+                       : ff_two_teams() ? "Choose up to 7 bots for the red and blue teams, and how hard they play."
+                                        : "Choose how many teams and bots, and how hard they play.";
         ImVec2 t2s = ImGui::CalcTextSize(t2);
         dl->AddText(ImVec2(body0.x + (grid_w - t2s.x) * 0.5f, body0.y + body_h * 0.36f + px(48)), TEXT2, t2);
         pop();
         ImGui::SetCursorScreenPos(ImVec2(body0.x + (grid_w - px(220)) * 0.5f, body0.y + body_h * 0.36f + px(92)));
         if (button("Quick setup##empty", PRIMARY, ImVec2(px(220), px(46)))) {
-            qs_teams = hb_panel_firefight == 1 ? 1 : 2; qs_per = hb_panel_firefight ? 3 : 4;   // (Reach Firefight: 3 a side, your seat the 4th)
+            qs_teams = ff_one_team() ? 1 : 2; qs_per = ff_one_team() ? 3 : ff_two_teams() ? 3 : 4;
             qs_tier = (int)(*e.difficulty <= 5 ? *e.difficulty : 4);
             ImGui::OpenPopup("Quick setup");
         }
@@ -3339,8 +3231,8 @@ bool bots_panel(bots_panel_env& e) {
         scale_tooltip(e.scale_games ? (int)*e.scale_games : 5);
     ImGui::EndDisabled();
     char lim[96];
-    if (hb_panel_firefight == 2) sprintf_s(lim, "%d of 7 bots. Firefight holds 8 players, 4 a side.", r.n);
-    else if (hb_panel_firefight) sprintf_s(lim, "%d of 7 bots. Firefight holds 8 players.", r.n);
+    if (ff_one_team()) sprintf_s(lim, "%d of 3 bots. Firefight holds 4 players.", r.n);
+    else if (ff_two_teams()) sprintf_s(lim, "%d of 7 bots. Firefight holds 8 players.", r.n);
     else sprintf_s(lim, "%d of %d bots. The game holds 16 players.", r.n, HB_ROSTER_MAX);
     push(SMALL);
     float lw2 = ImGui::CalcTextSize(lim).x;

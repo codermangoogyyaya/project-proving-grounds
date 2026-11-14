@@ -107,37 +107,6 @@ static uint32_t hr_near_vehicle(uint8_t* tls, uint8_t* unit, bool turret) {
     return best;
 }
 
-// the control device a bot's Use works (Nov 8, Generator Defense): the nearest powered control (object type 8, device
-// power +0x1B0 over 0.5) within 3 u across and 2 up or down, placed at its parent's place when it rides one (a
-// generator's lockdown switch sits 0.17 u up in the generator's frame). Interaction slot type 4 takes types 4/7/8
-// (ghidra/hr_slot_check.c: FUN_18005030c's mask 400) and runs FUN_1804d31a8(object, unit), the control's use (the
-// same call the object-type-8 path makes, ghidra/hr_unit_action_callers.c). Health stations are controls too
-static uint32_t hr_near_control(uint8_t* tls, uint8_t* unit) {
-    uint8_t* hdr = *(uint8_t**)(tls + 0x10);
-    uint8_t* ents = hdr ? *(uint8_t**)(hdr + 0x50) : nullptr;
-    if (!ents || !unit) return 0xFFFFFFFFu;
-    const float* me = (const float*)(unit + 0x44);
-    uint32_t best = 0xFFFFFFFFu;
-    float bd = 3.0f * 3.0f;
-    for (int i = 0, mx = *(int32_t*)(hdr + 0x2C); i < mx; i++) {
-        uint8_t* e = ents + (size_t)i * 0x18;
-        uint8_t* o = *(uint8_t**)(e + 0x10);
-        if (!*(uint16_t*)e || e[4] != 8 || !o || *(float*)(o + 0x1B0) <= 0.5f) continue;
-        const float* p = (const float*)(o + 0x44);
-        float px = p[0], py = p[1], pz = p[2];
-        uint32_t parent = *(uint32_t*)(o + 0x14);
-        if (parent != 0xFFFFFFFFu) {
-            uint8_t* po = hr_object(tls, parent);
-            if (!po) continue;
-            const float* b = (const float*)(po + 0x44);
-            px += b[0]; py += b[1]; pz += b[2];
-        }
-        float dx = px - me[0], dy = py - me[1], dz = pz - me[2], d2 = dx * dx + dy * dy;
-        if (d2 < bd && dz > -2.0f && dz < 2.0f) { bd = d2; best = (uint32_t)*(uint16_t*)e << 16 | (uint32_t)i; }
-    }
-    return best;
-}
-
 // the weapon lying in reach that a bot's Use takes (shared.h hb_pick_loose: the one its view is on, else the nearest
 // within 0.6 u), for the view it sends this tick
 static uint32_t hr_loose_weapon(uint8_t* tls, uint8_t* unit, float yaw, float pitch) {
@@ -371,81 +340,109 @@ void hr_bot_solo_spawn(uint32_t player) {
 // bot of a team with lives (Firefight) gets the person's own last spawn point, or else a spot 1.5 u behind him;
 // the game then spawns it on time and takes the life from the team as for him (live s187 Beachhead: bots back
 // after 10.0 s like the person, the team's lives 6 -> 0 one per respawn, then they waited)
-// Versus and Generator Defense (Nov 8): +0xAC is the side, not the lobby team: 1 Spartans (lives: the shared pool),
-// 7 Elites (-1, unlimited; a 15 s timer to the Spartans' 10 s), swapped at each turn. An Elite bot's spawn failed
-// the same way (live Beachhead Versus: timer down to 0, then dead for good) and came back at once with an Elite
-// spawn point set (logs/tmp/set_spawn.py). So the point is now the bot's own side's: where the game last spawned
-// someone of that side this match (a person's death-screen pick, a turn start; a new body is a new spawn), else a
-// person's last spawn point on its side (at a match's start it still holds the last match's: second), else behind a
-// living teammate of that side. Firefight is told by any side having lives (PvP has none).
+// ticks (60 a second) a bot of the person's opposing team waits for the brain's pick before it falls back (10 s)
+static const uint32_t HR_PICK_WAIT_TICKS = 600;
+static const uint32_t HR_PICK_WAIT_SIDE_TICKS = 600;   // his side: as the other side (10 s at 60 Hz): live_bots.py waits for a free point
+static uint32_t g_pick_wait_since[HB_MAX_PLAYERS];   // tick a bot began waiting for a pick (0 = not waiting)
 void hr_bot_spawn_point(uint32_t player) {
-    static bool logged[HB_MAX_PLAYERS], side_ok[8];
-    static uint32_t seen_unit[HB_MAX_PLAYERS];      // (a new body is a new spawn, this match or the next)
-    static float side_pt[8][6];
+    static bool logged[HB_MAX_PLAYERS];
     int index = player & 0xFFFF;
     if (!g_shm || !g_hr || index >= HB_MAX_PLAYERS) return;
-    auto is_bot = [](int i) {
-        for (int k = 0; k < HB_MAX_PLAYERS; k++) if (g_shm->bot_player_index[k] == i) return true;
-        return false;
-    };
+    bool bot = false;
+    for (int i = 0; i < HB_MAX_PLAYERS; i++) bot |= g_shm->bot_player_index[i] == index;
+    if (!bot) return;
     __try {
         uint8_t* tls = hr_tls();
         uint8_t* p = tls ? hr_player(tls, index) : nullptr;
         uint8_t* gg = tls ? *(uint8_t**)(tls + 0x20) : nullptr;
         if (!p || !gg) return;
-        int side = (int8_t)p[0xAC];
-        if (side < 0 || side >= 8) return;
-        uint32_t unit = *(uint32_t*)(p + 0x28);
-        if (unit != 0xFFFFFFFF) {                   // alive: where it came in is a spawn point of its side
-            if (unit != seen_unit[index]) {
-                seen_unit[index] = unit;
-                uint8_t* u = hr_object(tls, unit);
-                if (u && *(uint32_t*)(u + 0x14) == 0xFFFFFFFF) {   // (on foot: a rider's position is the seat's)
-                    memcpy(side_pt[side], u + 0x44, 12);
-                    memcpy(side_pt[side] + 3, u + 0x50, 12);
-                    side_pt[side][2] += 0.1f;
-                    side_pt[side][5] = 0.0f;
-                    side_ok[side] = true;
-                }
-            }
-            logged[index] = false;
-            return;
+        if (*(int32_t*)(p + 0x28) != -1) { logged[index] = false; g_pick_wait_since[index] = 0; return; }   // (alive: the wait restarts at its next death)
+        int team = (int8_t)p[0xAC];
+        if (team < 0 || team >= 8 || p[0x410]) return;
+        // Firefight: a team has lives (+0x16C + team * 4, -1 = no limit). Was asked of the BOT'S team, so a bot on a team
+        // with no limit (the Covenant's, blue, against the person's Spartans) never got a spawn point and never came
+        // back (the owner, Nov 10: "blue side bots aren't respawning", red ones did). Now any team's lives say it is
+        // Firefight, and every bot gets a spawn point.
+        bool firefight = false;
+        for (int t = 0; t < 8; t++) firefight |= *(int32_t*)(gg + 0x16C + t * 4) >= 0;
+        if (!firefight) return;
+        uint8_t* me = nullptr;                      // the person: the first player no bot is
+        for (int i = 0; i < HB_MAX_PLAYERS && !me; i++) {
+            bool b = false;
+            for (int k = 0; k < HB_MAX_PLAYERS; k++) b |= g_shm->bot_player_index[k] == i;
+            if (!b && hr_live(tls, i)) me = hr_player(tls, i);
         }
-        if (!is_bot(index)) return;                 // (a person's death screen picks his own)
-        bool ff = false;                           // (no side with lives: not Firefight)
-        for (int t = 0; t < 8; t++) ff |= *(int32_t*)(gg + 0x16C + t * 4) >= 0;
-        if (!ff || p[0x410]) return;
-        uint8_t* me = nullptr;                      // a person on its side
-        uint8_t* mate = nullptr;                    // else a living teammate
-        for (int i = 0; i < HB_MAX_PLAYERS; i++) {
-            uint8_t* q = hr_live(tls, i) && i != index ? hr_player(tls, i) : nullptr;
-            if (!q || (int8_t)q[0xAC] != side) continue;
-            if (!is_bot(i) && !me) me = q;
-            if (*(int32_t*)(q + 0x28) != -1 && !mate) mate = q;
-        }
+        if (!me) return;
         float* at = (float*)(p + 0x3EC);
-        const float* his = me ? (const float*)(me + 0x3EC) : nullptr;
-        const char* from;
-        if (side_ok[side]) {                        // the newest spawn of its side this match (a person's pick too)
-            memcpy(at, side_pt[side], 24);
-            from = "its side's last spawn";
-        } else if (his && (his[0] || his[1] || his[2])) {   // his last spawn point (at a match's start: the last
-            memcpy(at, his, 24);                            // match's, Nov 8, so second)
-            from = "his last spawn point";
-        } else {
-            uint8_t* who = me && *(int32_t*)(me + 0x28) != -1 ? me : mate;
-            uint8_t* u = who ? hr_object(tls, *(uint32_t*)(who + 0x28)) : nullptr;
-            if (!u) return;                         // (nobody of its side up, none seen spawn: wait)
+        const float* his = (const float*)(me + 0x3EC);
+        const char* from = nullptr;
+        const float* pick = g_shm->spawn_at[index];     // the brain's pick for this death (live_bots.py ff_spawn_check): its
+        bool picked = g_shm->spawn_seq[index] != g_shm->spawn_done[index]      // team's own side, not the person's start
+                      && isfinite(pick[0]) && isfinite(pick[1]) && isfinite(pick[2]) && isfinite(pick[3]);
+        // Which side the bot is on. The person's own spawn is only right for HIS side: a bot of the other team (the
+        // Spartans when he plays the Elites, or the reverse) used to come back there too, the owner, Nov 10: "the
+        // Spartans spawn at my spawn". Order for a bot of the other team: (1) the brain's pick; (2) wait for it
+        // (HR_PICK_WAIT_TICKS: the brain is a separate process, and at match start it may not be running yet);
+        // (3) where its own team last spawned or was put (g_team_spot), or the last spawn point of a teammate who is not
+        // standing at his; (4) behind a living teammate; (5) only then the person's spawn, so no bot stays dead.
+        static float g_team_spot[8][6];
+        static bool g_team_spot_set[8];
+        const int mine = (int8_t)me[0xAC];
+        const bool his_side = team == mine;
+        if (picked) {                               // it spawns there itself (hr_spawn_moves then moves it to the same spot)
+            at[0] = pick[0]; at[1] = pick[1]; at[2] = pick[2] + 0.1f;
+            at[3] = cosf(pick[3]); at[4] = sinf(pick[3]); at[5] = 0.0f;
+            memcpy(g_team_spot[team], at, 24);
+            g_team_spot_set[team] = true;
+            from = "the brain's pick for its team";
+        } else if (his_side && (his[0] || his[1] || his[2])) {    // his side: his last spawn point and facing (the game's own pick)
+            // after a short wait for the brain's pick (a free real spawn point: live_bots.py ff_spawn_check), so a bot never
+            // takes his one point on top of another bot
+            uint32_t now_tick = g_shm->game_tick;
+            if (!g_pick_wait_since[index]) g_pick_wait_since[index] = now_tick ? now_tick : 1;
+            if (now_tick - g_pick_wait_since[index] < HR_PICK_WAIT_SIDE_TICKS) return;
+            memcpy(p + 0x3EC, me + 0x3EC, 24);
+            from = "his last spawn point (his side)";
+        } else if (!his_side) {
+            uint32_t now_tick = g_shm->game_tick;
+            if (!g_pick_wait_since[index]) g_pick_wait_since[index] = now_tick ? now_tick : 1;
+            if (now_tick - g_pick_wait_since[index] < HR_PICK_WAIT_TICKS) return;   // (the brain's pick may still come: p[0x410] stays 0)
+            if (g_team_spot_set[team]) {
+                memcpy(at, g_team_spot[team], 24);
+                from = "where its team last spawned";
+            } else {
+                // a teammate's own last spawn point, when it is not the person's (a Spartan who spawned at the Spartans' start)
+                for (int i = 0; i < HB_MAX_PLAYERS && !from; i++) {
+                    uint8_t* q = i == index ? nullptr : hr_player(tls, i);
+                    if (!q || !hr_live(tls, i) || (int8_t)q[0xAC] != team || !q[0x410]) continue;
+                    const float* qa = (const float*)(q + 0x3EC);
+                    if (!(qa[0] || qa[1] || qa[2])) continue;
+                    float dx = qa[0] - his[0], dy = qa[1] - his[1];
+                    if (dx * dx + dy * dy < 15.0f * 15.0f) continue;       // (spawned where he did: the wrong side)
+                    memcpy(at, qa, 24);
+                    from = "a teammate's last spawn point";
+                }
+                // (no "behind a teammate": a spot behind one lies in walls and under stairs; his real spawn point is used next)
+            }
+            if (!from && (his[0] || his[1] || his[2])) {            // nothing of its own side known: never stay dead
+                memcpy(p + 0x3EC, me + 0x3EC, 24);
+                from = "his last spawn point (no spot of its own side known)";
+            }
+        }
+        if (!from) {
+            uint8_t* u = hr_object(tls, *(uint32_t*)(me + 0x28));
+            if (!u) return;                         // (he is down too, and never spawned at a point: wait)
             const float* pos = (const float*)(u + 0x44);
             const float* fwd = (const float*)(u + 0x50);
             at[0] = pos[0] - 1.5f * fwd[0]; at[1] = pos[1] - 1.5f * fwd[1]; at[2] = pos[2] + 0.1f;
             at[3] = fwd[0]; at[4] = fwd[1]; at[5] = 0.0f;
-            from = "behind a teammate";
+            from = "behind him";
         }
+        g_pick_wait_since[index] = 0;
         p[0x410] = 1;
         if (!logged[index]) {
             logged[index] = true;
-            logf("reach respawn: bot %d (side %d) spawns at %s (%.1f %.1f %.1f)", index, side, from, at[0], at[1], at[2]);
+            logf("reach respawn: bot %d spawns at %s (%.1f %.1f %.1f)", index, from, at[0], at[1], at[2]);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -528,7 +525,6 @@ static void __fastcall h_hr_update(uint8_t* actions) {
             g_shm->game = 4;
             if (tls && fr) {
                 hr_run_command(tls);
-                while (film_more(*(uint32_t*)(gg + HR_GG_TICKS))) hr_run_command(tls);   // a film: this tick's others
                 hr_spawn_moves(tls, fr, *(uint32_t*)(gg + HR_GG_TICKS));
                 if (*(uint32_t*)(actions + 8) & 1) {        // player 0's action, for decoding
                     memcpy(g_shm->dbg_action, actions + 0x10, HR_ACTION);
@@ -617,16 +613,6 @@ static void __fastcall h_hr_update(uint8_t* actions) {
                         *(uint16_t*)(act + 0x54) = 2;
                         *(uint32_t*)(act + 0x54 + 8) = loose;
                         use |= 0x200002u;
-                    }
-                    if (seat < 0 && (b & HB_BTN_ACTION) && (b & HB_BTN_DEVICE) && on_foot) {
-                        // the brain's device Use (HB_BTN_DEVICE: a guard's lockdown, never a pickup press): the control
-                        // in reach, slot 0 = {type 4, the control} and Use pressed, as for a pickup (hr_near_control)
-                        uint32_t ctl = hr_near_control(tls, unit);
-                        if (ctl != 0xFFFFFFFFu) {
-                            *(uint16_t*)(act + 0x54) = 4;
-                            *(uint32_t*)(act + 0x54 + 8) = ctl;
-                            use |= 0x200002u;
-                        }
                     }
                     if (seat >= 0 && (b & HB_BTN_ACTION) && on_foot) {
                         // on foot by a vehicle: interaction slot 0 = {type 5, seat at +4, the vehicle at +8} and Use
