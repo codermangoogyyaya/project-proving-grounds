@@ -5,6 +5,10 @@ Covenant in range: lead-aimed, reaction delay and aim error by tier, burst fire,
 shots do not hurt (behind cover the bot cannot see) is dropped for a few seconds. Logs every tick
 to logs/escort_<game>.jsonl and prints a score at the end.
 
+Reach Firefight on the DLC maps (no map data) also gets: team spawns (TeamSpawns: a bot of the team opposing the person
+respawns where its own side's AI were seen, not at his spawn) and hijacking (Escort.hijack / Escort.drive: an AI-driven
+ground vehicle of the other side within BOARD_R is boarded and driven at the nearest foe).
+
 usage: python -I escort_bots.py [seconds=120] [--game odst] [--tier average]
 """
 import argparse
@@ -25,6 +29,10 @@ CHEST = 0.45                          # aim this far above the feet (Elites and 
 TIERS = {"novice": (0.45, 0.06), "average": (0.30, 0.035), "strong": (0.22, 0.02), "top": (0.15, 0.012)}   # reaction s, aim error rad
 RANGE = 28.0
 MATCH_GONE = 6                         # failed reads in a row (0.5 s apart) that mean the match is over
+BOARD_R, BOARD_GIVE_UP, BOARD_BAN = 22.0, 8.0, 40.0   # u to an enemy-driven vehicle worth hijacking, s trying, s left alone after
+SPOT_AGE = 8.0                                         # s an AI is about before its place counts as its side's ground (not where it arrived)
+ROAM_DWELL, ROAM_MIN_LEG, ROAM_SEARCH = (5.0, 14.0), 40, 10.0   # s at a goal, points (0.75 u apart) a new goal lies from here, u to find one's footsteps
+SPAWN_WAIT, SPAWN_CLEAR, SPAWN_FOE, SPAWN_SPOTS = 25.0, 3.0, 25.0, 40   # TeamSpawns: s a pick stands, clearances (u), spots kept
 
 
 def wrap(a):
@@ -40,8 +48,121 @@ class Escort:
         s.last, s.stuck_t, s.wiggle_until, s.wiggle = None, 0.0, 0.0, (0.0, 0.0)
         s.err_xy, s.err_t, s.strafe, s.strafe_t = (0.0, 0.0), 0.0, 1.0, 0.0
         s.prev_tpos = None
+        s.board, s.board_ban = None, {}          # hijack: (vehicle, since), vehicle -> left alone until
+        s.drive_last, s.drive_still, s.reverse_until = None, 0.0, 0.0
+        s.roam, s.shared = False, {}             # roam: its own free will (set by main); shared: {bot: goal point}, to spread out
+        s.hi, s.goal, s.dwell_until, s.hi_t, s.retreat = None, None, 0.0, -9.0, False
 
-    def think(s, now, me, person, trail, enemies):
+    def weak(s, me, foes, pos):
+        """True while the bot is better off at the person's side than roaming: hurt, or too many foes about; it stays
+        there until it has recovered (shield and health back, the foes gone)."""
+        hp, sh = me.get("health", 1.0), me.get("shield", 1.0)
+        near = sum(1 for e in foes if math.dist(e["pos"], pos) < 25.0)
+        if s.retreat:
+            if hp >= 0.7 and sh >= 0.6 and near < 3:
+                s.retreat = False
+        elif hp < 0.5 or (sh < 0.15 and near) or near >= 5:
+            s.retreat = True
+        return s.retreat
+
+    def roam_target(s, now, me, person, hist):
+        """Free will without a map: walk the person's footsteps (hist: his positions with a segment number that changes at
+        every jump: always walkable) to a spot of the bot's own choosing, stay a while, pick the next. Spots favour places
+        away from him and from where the other bots are going. Returns the next waypoint (a few footsteps ahead), or
+        None: dwelling at a goal, or not on his footsteps (the caller then walks to him, which puts it back on them)."""
+        pos = me["pos"]
+        if not hist or now < s.dwell_until:
+            return None
+        if s.hi is not None and (math.hypot(hist[s.hi][0] - pos[0], hist[s.hi][1] - pos[1]) > ROAM_SEARCH
+                                 or abs(hist[s.hi][2] - pos[2]) > 3.0):
+            s.hi, s.goal = None, None
+        if s.hi is None:
+            if now - s.hi_t < 0.5:
+                return None
+            s.hi_t = now
+            best = None
+            for i, h in enumerate(hist):
+                d = math.hypot(h[0] - pos[0], h[1] - pos[1])
+                if d < ROAM_SEARCH and abs(h[2] - pos[2]) < 3.0 and (best is None or d < best[0]):
+                    best = (d, i)
+            if best is None:
+                return None
+            s.hi = best[1]
+        seg = hist[s.hi][3]
+        if s.goal is None or s.goal >= len(hist) or hist[s.goal][3] != seg:
+            lo = hi = s.hi
+            while lo > 0 and hist[lo - 1][3] == seg:
+                lo -= 1
+            while hi < len(hist) - 1 and hist[hi + 1][3] == seg:
+                hi += 1
+            cands = [i for i in (s.rng.randint(lo, hi) for _ in range(10)) if abs(i - s.hi) >= ROAM_MIN_LEG]
+            if not cands:
+                s.dwell_until = now + 3.0
+                return None
+            others = [g for k, g in s.shared.items() if k != s.index]
+            def score(i):
+                h = hist[i]
+                return min(40.0, math.dist(h[:2], person["pos"][:2])) + min(40.0, min((math.dist(h[:2], g[:2]) for g in others), default=40.0))
+            s.goal = max(cands, key=score)
+            s.shared[s.index] = hist[s.goal][:3]
+        step = 1 if s.goal > s.hi else -1
+        while abs(s.hi - s.goal) > 2 and 0 <= s.hi + step < len(hist) and hist[s.hi + step][3] == seg:
+            d0 = math.hypot(hist[s.hi][0] - pos[0], hist[s.hi][1] - pos[1])
+            d1 = math.hypot(hist[s.hi + step][0] - pos[0], hist[s.hi + step][1] - pos[1])
+            if d0 >= 1.2 and d1 > d0:                   # (on to the next footstep once it is nearer than this one)
+                break
+            s.hi += step
+        if abs(s.hi - s.goal) <= 2:                     # there: stay a while, then somewhere else
+            s.dwell_until, s.goal = now + s.rng.uniform(*ROAM_DWELL), None
+            s.shared.pop(s.index, None)
+            return None
+        j = max(0, min(len(hist) - 1, s.hi + step * 3))
+        return hist[j]
+
+    def hijack(s, now, me, v):
+        """On foot, to an enemy-driven vehicle v (vehicle_scan) and Use at its driver's seat (Reach: the boarding seat, as
+        bot.py's board does). None once it would not take us in BOARD_GIVE_UP s (that vehicle is then left alone)."""
+        pos, vp = me["pos"], v["pos"]
+        if s.board is None or s.board[0] != v["handle"]:
+            s.board = (v["handle"], now)
+        if now - s.board[1] > BOARD_GIVE_UP:
+            s.board_ban[v["handle"]] = now + BOARD_BAN
+            s.board = None
+            return None
+        d = math.hypot(vp[0] - pos[0], vp[1] - pos[1])
+        yaw = math.atan2(vp[1] - pos[1], vp[0] - pos[0])
+        buttons = 0
+        if d < 2.6:
+            if int(now * 6) % 2 == 0:
+                buttons |= botctl.BTN["action"]
+            from brain import vehicles as V
+            seat = V.reach_seat(v["kind"], "board", int(now - s.board[1]))
+            if seat:
+                buttons |= ((seat[0] + 1) & 15) << 14 | (1 << 18 if seat[1] else 0)    # shared.h HB_SEAT_SHIFT / turret bit
+        return (1.0 if d > 1.6 else 0.0), 0.0, yaw, 0.0, buttons
+
+    def drive(s, now, me, vpos, person, foes):
+        """At the wheel of a ground vehicle (a driver steers by facing): at the nearest foe within 60 u, else to the person;
+        shoots at one within 45 u; backs off what it is stuck on."""
+        near = min((e for e in foes if math.dist(e["pos"], vpos) < 60.0), key=lambda e: math.dist(e["pos"], vpos), default=None)
+        goal = near["pos"] if near else (person["pos"] if person and person["pos"] else None)
+        if goal is None:
+            return 0.0, 0.0, 0.0, 0.0, 0
+        d = math.hypot(goal[0] - vpos[0], goal[1] - vpos[1])
+        yaw = math.atan2(goal[1] - vpos[1], goal[0] - vpos[0])
+        if now < s.reverse_until:
+            return -1.0, 0.0, s.drive_yaw, 0.0, 0
+        fwd = 1.0 if d > (14.0 if near else 8.0) else 0.0
+        if s.drive_last and fwd and math.dist(vpos[:2], s.drive_last[:2]) < 0.02:
+            s.drive_still += 1.0 / HZ
+        else:
+            s.drive_still = 0.0
+        s.drive_last = vpos
+        if s.drive_still > 2.0:                  # wedged: back off for a moment, turned away
+            s.reverse_until, s.drive_still, s.drive_yaw = now + 1.5, 0.0, yaw + s.rng.choice((-1.0, 1.0))
+        return fwd, 0.0, yaw, 0.0, botctl.BTN["fire"] if near and d < 45.0 and int(now * 8) % 4 < 2 else 0
+
+    def think(s, now, me, person, trail, enemies, hist=None):
         fwd = strafe = 0.0
         yaw = math.atan2(me["aim"][1], me["aim"][0]) if me["aim"] else 0.0
         pitch, fire = 0.0, False
@@ -58,7 +179,11 @@ class Escort:
         if trail and (s.trail_i >= len(trail) or math.dist(trail[min(s.trail_i, len(trail) - 1)][:2], pos[:2]) > 12):
             s.trail_i = min(range(len(trail)), key=lambda i: math.dist(trail[i][:2], pos[:2]))   # rejoin (respawned)
         goal = None
-        if d_person > (6.0 if s.target is None else 9.0) and trail:
+        roaming = bool(s.roam and hist and not s.weak(me, enemies, pos))
+        if roaming:                                 # its own way about the map
+            goal = s.roam_target(now, me, person, hist)
+            roaming = goal is not None or s.hi is not None          # (dwelling counts; not on his footsteps: go to him)
+        if not roaming and d_person > (6.0 if s.target is None else 9.0) and trail:
             while s.trail_i < len(trail) - 1 and math.dist(trail[s.trail_i][:2], pos[:2]) < 1.2:
                 s.trail_i += 1
             goal = trail[min(s.trail_i, len(trail) - 1)]
@@ -113,17 +238,107 @@ class Escort:
         return fwd, strafe, yaw, pitch, buttons
 
 
+def vehicle_scan(live, players):
+    """{handle: {handle, pos, kind, driver}}: the ground vehicles lying about (not a gun riding on one), each with the
+    AI that drives it (live.ai_riders, the seat 0 rider) or None."""
+    from brain import vehicles as V
+    import struct
+    roots = {}
+    for h, typ, path, pos in live.objects((1,)):
+        try:
+            par = struct.unpack("<I", live.g.read(live.object(h) + getattr(live, "PARENT_AT", 0x14), 4))[0]
+        except Exception:
+            continue
+        if par != 0xFFFFFFFF:
+            continue
+        kind = V.variant(path.rsplit("\\", 1)[-1], ())
+        if V.kind_of(kind) in V.BOARDABLE:
+            roots[h] = dict(handle=h, pos=pos, kind=kind, driver=None)
+    for r in live.ai_riders(players):
+        v = roots.get(r["vehicle"])
+        if v is not None and r["seat"] in (None, 0):
+            v["driver"] = r
+    return roots
+
+
+class TeamSpawns:
+    """Reach Firefight without map data: a bot of the team OPPOSING the person (the Spartans when he plays the Elites,
+    or the Covenant's team when he plays the Spartans) respawns on its own side, not at his spawn (botcore's fallback).
+    The sides' ground is learned from where their AI were first seen: team 1 (the Covenant's) by the Covenant AI, team 0
+    by the human-side AI. Sent to botcore while the bot is dead (botctl.spawn_at); a pick still out after SPAWN_WAIT s is
+    called off (NaN: botcore's own fallback). No spots known for a side: nothing is sent."""
+
+    def __init__(s, m, rng):
+        s.m, s.rng = m, rng
+        from brain.live import Walked
+        s.spots = {0: [], 1: []}
+        s.walked = Walked()
+        s.seen, s.picks, s.gave_up, s.warned = {}, {}, set(), set()
+
+    def learn(s, now, ai, players):
+        """The sides' ground, from AI that have been about SPOT_AGE s (where an AI first shows can be out of bounds: it
+        arrives from outside the play area), and the ground anyone has walked (Walked: a pick must be on it)."""
+        s.walked.feed(now, [(p["index"], p["pos"]) for p in players if p["pos"] and p.get("vehicle", -1) in (None, -1)]
+                      + [(e["index"], e["pos"]) for e in ai])
+        for e in ai:
+            t0 = s.seen.setdefault(e["index"], now)
+            if t0 is None or now - t0 < SPOT_AGE:
+                continue
+            s.seen[e["index"]] = None
+            pool = s.spots[0 if e.get("human") else 1]
+            if all(math.dist(e["pos"], q) > SPAWN_CLEAR for q in pool):
+                pool.append(e["pos"])
+                del pool[:-SPAWN_SPOTS]
+
+    def step(s, now, index, me, players, ai):
+        if me["pos"]:                                  # alive: this death's pick is spent
+            s.picks.pop(index, None)
+            s.gave_up.discard(index)
+            return
+        if index in s.gave_up:
+            return
+        if index in s.picks:
+            if now - s.picks[index][1] > SPAWN_WAIT:
+                botctl.spawn_at(s.m, index, math.nan, math.nan, math.nan, 0.0)
+                s.gave_up.add(index)
+                print(f"{now:6.1f}s bot {index}: spawn pick called off after {SPAWN_WAIT:.0f}s", flush=True)
+            return
+        pool = s.spots[0 if me["team"] == 0 else 1]
+        if not pool:
+            if me["team"] not in s.warned:
+                s.warned.add(me["team"])
+                print(f"{now:6.1f}s no AI of team {me['team']}'s side seen yet: its bots use botcore's fallback", flush=True)
+            return
+        alive = [p["pos"] for p in players if p["pos"]] + [e["pos"] for e in ai]
+        foes = [p["pos"] for p in players if p["pos"] and p["team"] != me["team"]] + [e["pos"] for e in ai if e["team"] != me["team"]]
+        taken = [v[0] for v in s.picks.values()]
+        ok = [c for c in pool if all(math.dist(c[:2], q[:2]) >= SPAWN_CLEAR for q in alive + taken)
+              and (not s.walked.known() or s.walked.near(c[0], c[1], c[2]))]
+        far = [c for c in ok if all(math.dist(c[:2], q[:2]) >= SPAWN_FOE for q in foes)] or ok
+        if not far:
+            return
+        c = s.rng.choice(far)
+        near = min(foes, key=lambda q: math.dist(c[:2], q[:2]), default=None)
+        yaw = math.atan2(near[1] - c[1], near[0] - c[0]) if near else 0.0
+        s.picks[index] = (c, now)
+        botctl.spawn_at(s.m, index, c[0], c[1], c[2], yaw)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("seconds", type=float, nargs="?", default=120)
     ap.add_argument("--game", default="odst")
     ap.add_argument("--tier", default="average")
+    ap.add_argument("--follow", action="store_true", help="Reach: stay at the person's side (the old behaviour) instead of roaming")
     o = ap.parse_args()
     from brain.live import LiveODST, LiveReach
     live, m = {"odst": LiveODST, "reach": LiveReach}[o.game](), botctl.shm()   # (Reach: its Firefight maps)
     rng = random.Random(5)
     bots = {}
     trail = []
+    spawns = TeamSpawns(m, rng) if o.game == "reach" else None
+    hist, roam_goals = [], {}                       # the person's footsteps with a segment number; where each bot is heading
+    roots, roots_t = {}, -9.0
     log = open(os.path.join(HERE, "..", "logs", f"escort_{o.game}.jsonl"), "w")
     t0 = time.time()
     fails = 0
@@ -146,17 +361,56 @@ def main():
         fails = 0
         ps = {p["index"]: p for p in players}
         person = ps.get(0)
+        if spawns:
+            spawns.learn(now, enemies, players)
+        if o.game == "reach" and now - roots_t > 0.5:      # the ground vehicles and who drives them, twice a second
+            roots_t = now
+            try:
+                roots = vehicle_scan(live, players)
+            except Exception as e:
+                roots = {}
+                if not getattr(main, "scan_warned", False):
+                    main.scan_warned = True
+                    print("vehicle scan failed (hijacking off):", type(e).__name__, e, flush=True)
         if person and person["pos"] and (not trail or math.dist(trail[-1][:2], person["pos"][:2]) > 0.75):
             trail.append(person["pos"])
             trail = trail[-600:]
+        if person and person["pos"] and person.get("vehicle", -1) in (None, -1) and len(hist) < 30000 \
+                and (not hist or math.dist(hist[-1][:2], person["pos"][:2]) > 0.75):
+            seg = 0 if not hist else hist[-1][3] + (0 if math.dist(hist[-1][:3], person["pos"][:3]) < 6.0 else 1)   # (a jump: respawn, a lift)
+            hist.append((person["pos"][0], person["pos"][1], person["pos"][2], seg))
         for slot, index in botctl.status(m)["bots"].items():
             if index not in bots:
                 bots[index] = Escort(slot, index, o.tier, rng)
+                bots[index].roam, bots[index].shared = o.game == "reach" and not o.follow, roam_goals
             me = ps.get(index)
+            if spawns and me and person and me["team"] != person["team"]:
+                spawns.step(now, index, me, players, enemies)
             if not me or not me["pos"] or not person or not person["pos"]:
                 continue
             foes = [e for e in enemies if e["team"] != me["team"]]     # (Versus' Elite round: the Covenant are allies)
-            fwd, strafe, yaw, pitch, buttons = bots[index].think(now, me, person, trail, foes)
+            veh = me.get("vehicle", -1)
+            if o.game == "reach" and veh not in (None, -1):            # at the wheel (a hijacked one): drive it
+                rv = roots.get(veh)
+                if rv is None:
+                    continue
+                fwd, strafe, yaw, pitch, buttons = bots[index].drive(now, me, rv["pos"], person, foes)
+                botctl.act(m, slot, fwd, strafe, yaw, pitch, buttons)
+                continue
+            fwd = None
+            if o.game == "reach" and roots:                           # an enemy-driven vehicle near: hijack it
+                b0 = bots[index]
+                cand = [v for v in roots.values() if v["driver"] and v["driver"]["team"] != me["team"]
+                        and b0.board_ban.get(v["handle"], 0) < now
+                        and math.hypot(v["pos"][0] - me["pos"][0], v["pos"][1] - me["pos"][1]) < BOARD_R
+                        and abs(v["pos"][2] - me["pos"][2]) < 4.0]
+                if cand:
+                    best = min(cand, key=lambda v: math.dist(v["pos"], me["pos"]))
+                    r = b0.hijack(now, me, best)
+                    if r:
+                        fwd, strafe, yaw, pitch, buttons = r
+            if fwd is None:
+                fwd, strafe, yaw, pitch, buttons = bots[index].think(now, me, person, trail, foes, hist)
             botctl.act(m, slot, fwd, strafe, yaw, pitch, buttons)
             b = bots[index]
             tgt = next((e for e in enemies if e["index"] == b.target), None)

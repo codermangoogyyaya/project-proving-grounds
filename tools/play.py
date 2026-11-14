@@ -7,7 +7,6 @@ usage: python -I play.py [--red N] [--blue N] [--tier T[,T..]] [--minutes M]
 Stop with Ctrl+C. Bots stay in the game, standing still, until the match ends.
 """
 import argparse
-import faulthandler
 import glob
 import os
 import struct
@@ -88,45 +87,6 @@ def roster_plan(roster, players, teams, game):
     return out
 
 
-def ff_plan(plan, players, game):
-    """Firefight's bots of roster_plan's [(team, name)]: ([(team, name)] that join, [names left out]). ODST: all on the
-    person's team, 8 players in all. Reach: the panel's Spartan team (0) and Elite team (1) are the lobby's first two
-    teams (live Beachhead Versus Nov 8: team 0 Red, the first turn's Spartans; 1 Blue, its Elites), 4 a side with the
-    people already there, 8 in all (docs/bot-brain/11-reach-firefight-versus.md 9.2)."""
-    cap = botctl.player_cap(game, firefight=True)
-    side = {}
-    for p in players:
-        side[p["team"]] = side.get(p["team"], 0) + 1
-    total, out, left = len(players), [], []
-    for team, name in plan:
-        team = players[0]["team"] if game == "odst" and players else min(max(team, 0), 1)
-        if total >= cap or (game != "odst" and side.get(team, 0) >= botctl.FF_SIDE):
-            left.append(name)
-            continue
-        out.append((team, name))
-        side[team] = side.get(team, 0) + 1
-        total += 1
-    return out, left
-
-
-def add_bot(m, machine, team, name, game):
-    """botctl.add_bot with this install's look, clan and emblem for the name, waited through a paused game (botcore
-    takes commands on the game's thread: none in the pause menu). Prints the outcome; True when the game made it. A
-    timeout read as ok before, and the next add overwrote the one not yet taken: of 3 bots asked for in ODST Firefight
-    (Nov 7, 00:07, the player in the pause menu saving a bug report) only the last one joined."""
-    faulthandler.cancel_dump_traceback_later()       # (a bot asked for: the brain is not stuck before its adds)
-    r = botctl.add_bot(m, machine, team, name, game, look=looks.look(name, game), clan=looks.clan_of(name),
-                       emblem=looks.emblem_of(name))
-    if r.get("timeout"):
-        print(f"bot {name}: the game is not taking commands (paused?): waiting", flush=True)
-        if botctl.idle(m, 600.0):
-            r = botctl.status(m)
-    res = r.get("result", -1)
-    ok = not r.get("timeout") and not r.get("fault") and (res & 0xFFFFFFFF != 0xFFFFFFFF and res > -100 or res < -100)
-    print(f"bot {name} on team {team}:", "ok" if ok else r, flush=True)
-    return ok
-
-
 def module_loaded(name):
     import ctypes as C
     from memread import find_pid, PROCESS
@@ -162,9 +122,6 @@ def main():
     ap.add_argument("--roster", help="botcore.ini with the BOTS panel's list: exactly those bots join (names, "
                     "teams, difficulty, play style); --red / --blue fill teams only when there is no list")
     o = ap.parse_args()
-    # a brain that asked for no bot within its wait and a minute prints where it is (logs\brain.txt; Halo 3, Nov 8:
-    # "game h3", "map ..." and nothing more while the match ran)
-    faulthandler.dump_traceback_later(o.wait + 60)
     override = os.path.join(ROOT, "logs", "test_override.json")
     if os.path.exists(override):     # Claude's test games: these settings instead of the BOTS panel's,
         import json                  # so the player's botcore.ini and panel are never touched (logs\ is not in git)
@@ -255,43 +212,66 @@ def main():
     names = make_names(16, taken=[p["name"] for p in players] + names) + names   # (popped from the end)
     firefight = getattr(live, "firefight", lambda: False)()
     ff = firefight or o.game == "odst"
+    reach_ff = firefight and o.game == "reach"      # Reach Firefight plays as a multiplayer custom game: its own BOTS list
+    if reach_ff and not teams:                      # (ffbot=: a team and a style per bot, up to 7), red and blue teams only
+        teams = True
+        print("Firefight: red / blue teams (the Covenant AI are blue)")
     roster = botctl.roster(o.roster) if o.roster and not o.lidar else None
-    if roster is not None and ff:                    # Firefight's own list (botcore.cpp ff_seed: the first 3 till saved)
-        ff_list = botctl.roster(o.roster, firefight=True, game=o.game)
-        roster = ff_list if ff_list is not None else roster[:botctl.FIREFIGHT_PLAYERS - 1]
-    # one cap on every path below, LiDAR included: Firefight holds 8 players, ODST's and Reach's
-    room = botctl.player_cap(o.game, ff) - len(players)
+    ff_own = False                                   # the bots come from Firefight's own list (ffbot=)
+    if roster is not None and ff:                    # Firefight's own list (botcore.cpp ff_seed: the first 7 till saved)
+        ff_list = botctl.roster(o.roster, firefight=True)
+        if reach_ff and ff_list is not None and not (len(ff_list) > 3 or any(b["team"] == 1 for b in ff_list)):
+            # a Firefight list of up to 3 bots, all red, is the old panel's (it cannot make a blue bot or a fourth): the
+            # multiplayer list (the custom game lobby's red / blue panel) is used, 7 bots at most, the teams evenly
+            print("Firefight: the panel here has no blue team; playing the custom game list (red and blue)")
+            ff_list = None
+        ff_own = ff_list is not None
+        if ff_list is not None:
+            roster = ff_list
+        elif reach_ff:
+            sides = [[b for b in roster if b["team"] % 2 == k] for k in (0, 1)]
+            roster = [b for pair in zip(*sides) for b in pair]                       # red, blue, red, blue ...
+            roster += sides[0][len(sides[1]):] + sides[1][len(sides[0]):]            # (the longer team's rest)
+            roster = roster[:botctl.REACH_FIREFIGHT_BOTS]
+        else:
+            roster = roster[:botctl.player_cap(o.game, firefight) - 1]
+    # one cap on every path below, LiDAR included: ODST's Firefight holds 4 players in all (it crashed with more),
+    # Reach's 8
+    room = botctl.player_cap(o.game, firefight) - len(players)
+    if reach_ff:                                     # never more than 7 bots
+        room = min(room, botctl.REACH_FIREFIGHT_BOTS)
     if getattr(o, "max_bots", None) is not None:     # test override: leave room for Claude's probe bots
         room = min(room, int(o.max_bots))
     if room < botctl.MAX_PLAYERS - len(players):
-        print(f"Firefight: {room} bots at most ({botctl.player_cap(o.game, ff)} players in all)")
-    if roster is not None:                           # the BOTS panel's list (Firefight: its own, 4 a side in Reach)
+        print(f"Firefight: {room} bots at most ({botctl.player_cap(o.game, firefight)} players in all)")
+    if roster is not None:                           # the BOTS panel's list (ODST Firefight: its first 3, all your teammates;
+                                                     # Reach Firefight: up to 8 in all, each bot on the red or blue team its row names)
         print(f"bot list: {len(roster)} bots from {o.roster}" + (f", {max(0, room)} join (Firefight)" if ff else ""))
-        plan = roster_plan(roster, players, teams, o.game)
-        if ff:
-            plan, left = ff_plan(plan, players, o.game)
-            if left:                                 # (the person took a seat on a side the list filled)
-                print("Firefight: no room for", ", ".join(left))
-                botctl.notice(m, "Firefight is full", f"{len(left)} {'bot' if len(left) == 1 else 'bots'} left out: "
-                              f"{botctl.player_cap(o.game, ff)} players in all"
-                              + (f", {botctl.FF_SIDE} a side" if o.game != "odst" else ""))
-        for team, name in plan[:max(0, room)]:
-            add_bot(m, machine, team, name, o.game)
+        for team, name in roster_plan(roster, players, teams, o.game)[:max(0, room)]:
+            if firefight and o.game == "reach":      # red (0) or blue (1) by its row; blue is the Campaign AI's team
+                team = team % 2
+            elif ff:
+                team = players[0]["team"]
+            r = botctl.add_bot(m, machine, team, name, o.game, look=looks.look(name, o.game), clan=looks.clan_of(name),
+                               emblem=looks.emblem_of(name))
+            print(f"bot {name} on team {team}:", "ok" if not r.get("fault") and r.get("result", -1) & 0xFFFFFFFF != 0xFFFFFFFF and r.get("result", -1) > -100 or r.get("result", -1) < -100 else r)
             machine += 1
     elif teams:
         count = {0: 0, 1: 0}
         for p in players:
             count[p["team"]] = count.get(p["team"], 0) + 1
         sides = ((0, o.red), (1, o.blue))
-        if firefight or o.game == "odst":            # Firefight: teammates only
-            sides = ((players[0]["team"], botctl.ODST_FF_PLAYERS if o.game == "odst" else botctl.FIREFIGHT_PLAYERS),)
+        if (firefight and not reach_ff) or o.game == "odst":   # ODST: teammates only (Reach Firefight, no list: --red / --blue)
+            sides = ((players[0]["team"], botctl.player_cap(o.game, firefight)),)
         if o.lidar:                                  # LiDAR: everyone mapping on the player's side
             sides = ((players[0]["team"], o.lidar),)
         for team, want in sides:
             while count[team] < want and machine < 16 and room > 0:
                 room -= 1
                 name = names.pop()
-                add_bot(m, machine, team, name, o.game)
+                r = botctl.add_bot(m, machine, team, name, o.game, look=looks.look(name, o.game), clan=looks.clan_of(name),
+                                   emblem=looks.emblem_of(name))
+                print(f"bot {name} on {'red' if team == 0 else 'blue'}:", "ok" if not r.get("fault") and r.get("result", -1) & 0xFFFFFFFF != 0xFFFFFFFF and r.get("result", -1) > -100 or r.get("result", -1) < -100 else r)
                 count[team] += 1
                 machine += 1
     else:                                            # every bot on its own team, up to red + blue players
@@ -303,7 +283,9 @@ def main():
             while team in used:
                 team += 1
             name = names.pop()
-            add_bot(m, machine, team, name, o.game)
+            r = botctl.add_bot(m, machine, team, name, o.game, look=looks.look(name, o.game), clan=looks.clan_of(name),
+                               emblem=looks.emblem_of(name))
+            print(f"bot {name} on team {team}:", "ok" if not r.get("fault") and r.get("result", -1) & 0xFFFFFFFF != 0xFFFFFFFF and r.get("result", -1) > -100 or r.get("result", -1) < -100 else r)
             used.add(team)
             machine += 1
     if getattr(o, "brain", "") == "none":            # test override only: bots added, Claude's probe drives them
@@ -327,7 +309,7 @@ def main():
                     "--tier", o.tier, "--personality", "rusher,flanker,camper,objector,spammer,grudger,sniper",
                     "--map", map_name, "--game", o.game, "--quiet"] + ([] if teams else ["--ffa"]) +
                    (["--roster", o.roster] if roster is not None else []) +   # each bot's own settings
-                   (["--ff-list"] if roster is not None and ff else []) +      # (Firefight's list: its ffbot= lines)
+                   (["--ff-list"] if roster is not None and ff_own else []) +      # (Firefight's list: its ffbot= lines)
                    (["--collect", "on"] if getattr(o, "collector", "off") == "on" or
                     (o.roster and botctl.setting(o.roster, "collector", "0") == "1") else []) +   # Data collector (tools/collector.py)
                    (["--ride-only", o.ride_only] if getattr(o, "ride_only", None) else []) +   # test override: one kind
