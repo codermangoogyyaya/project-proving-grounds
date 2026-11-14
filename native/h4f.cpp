@@ -16,25 +16,10 @@
 #include <wchar.h>
 #include <intrin.h>
 #include "shared.h"
-#include "film.h"
 #include "third_party/minhook/include/MinHook.h"
 
 extern hb_shared* g_shm;
 extern uint32_t g_prejoin;                     // botcore.cpp (botcore.ini prejoin=)
-extern uint32_t g_playback;                    // botcore.cpp: a Theater film is running (no brain)
-
-// Theater (film.cpp): the game globals (TLS slot), its playback flag (1 while a film plays; the u32 after it is 1 while
-// a match records), its tick count (60 a second, the same at the same moment of a match and its film) and the options
-// (the game and map variants, from +0x274, TLS +0x40's block: the same bytes all match long and in its film, other in
-// another match: the film key). Halo 4 from dumps of matches and a film (logs/tmp/h4_film, Nov 7: +0x1D074 0 / 1, ticks
-// 1976 at 0:33 of the film; the bytes before +0x234 were the same on Ragnarok and Forge Island, so not the key). H2A
-// the same (a Lockdown match and its film, Nov 8: +0x1D074 0 / 1, +0x1D078 1 / 0, ticks 60 a second). The key ends at
-// +0x2B8, a heap pointer that changed between that match and its film (it would have found no recording, and the film
-// no bots); before it the match's random seed (+0x29C, 12 bytes), the same in both
-struct f_film_at { size_t slot, play, ticks, key_at, key_len; };
-static const f_film_at F_FILM[2] = { { 0xE8, 0x1D074, 0x2DE10, 0x274, 0x2B8 - 0x274 },
-                                     { 0xE8, 0x1D074, 0x2DE10, 0x274, 0x2B8 - 0x274 } };   // H2A, H4
-static uint32_t g_film_tick;                   // this tick's count while a live match records (f_command), else ~0
 void logf(const char* fmt, ...);
 void report_note_bot(int index, const wchar_t* name, const wchar_t* tag, int team, const wchar_t* clan,
                      const uint16_t* emblem);   // report.cpp
@@ -254,16 +239,6 @@ static const f_board_fns* f_board_ok(h4f_game& G) {
 // one), or NONE. Halo 4: one on its side or roof is passed over (its up vector at object +0x7C, the forward one at
 // +0x70: found live on Exile; H2A's not checked yet). Taken in, a bot was put out a second later, again and again: the
 // Warthog at Exile's double spawn lay on its roof beside the standing one a bot went for, and was the nearer
-// the seats an object has (the game's own seat list), 0 without the decoded build (tests/test_faults.cpp swaps it)
-static int f_seat_count_game(h4f_game& G, uint32_t handle) {
-    const f_board_fns* B = f_board_ok(G);
-    static f_seat s[16];
-    int16_t n = 0;
-    if (B) ((f_seats_fn)(G.mod + B->seats))(handle, s, &n, 16);
-    return n;
-}
-static int (*f_seat_count)(h4f_game&, uint32_t) = f_seat_count_game;
-
 static uint32_t f_near_vehicle(h4f_game& G, uint8_t* tls, uint8_t* unit) {
     uint8_t* hdr = *(uint8_t**)(tls + 0x18);
     uint8_t* ents = hdr ? *(uint8_t**)(hdr + 0x50) : nullptr;
@@ -273,21 +248,13 @@ static uint32_t f_near_vehicle(h4f_game& G, uint8_t* tls, uint8_t* unit) {
     float best = 3.0f * 3.0f;
     for (int i = 0, mx = *(int32_t*)(hdr + 0x2C); i < mx; i++) {
         uint8_t* e = ents + (size_t)i * 0x18;
-        // type 1: a vehicle; Halo 4's giants too (type 13), and its Mantis, a biped in a match (type 0: Forge Island,
-        // Nov 7, objects\characters\storm_mantis), told from a Spartan by its seats. Types 1 and 13 only, no bot got in
-        // a Mantis
-        uint8_t t = e[4];
-        bool vehicle_type = t == 1 || (G.id == 7 && (t == 13 || t == 0));
-        uint8_t* o = *(uint16_t*)e && vehicle_type ? *(uint8_t**)(e + 0x10) : nullptr;
-        if (!o || o == unit || *(uint32_t*)(o + 0x24) != 0xFFFFFFFFu) continue;         // top level (not a gun on one)
-        if (G.id == 7 && t != 0 && ((const float*)(o + 0x7C))[2] < 0.5f) continue;      // on its side or roof
+        uint8_t* o = *(uint16_t*)e && e[4] == 1 ? *(uint8_t**)(e + 0x10) : nullptr;   // type 1: a vehicle
+        if (!o || *(uint32_t*)(o + 0x24) != 0xFFFFFFFFu) continue;                      // top level (not a gun on one)
+        if (G.id == 7 && ((const float*)(o + 0x7C))[2] < 0.5f) continue;                // on its side or roof
         if (o[0x16C] & 4) continue;   // destroyed (damage flags bit 2: both games' object_get_health reads 0 then)
         const float* q = (const float*)(o + 0x40);
         float d = (q[0] - me[0]) * (q[0] - me[0]) + (q[1] - me[1]) * (q[1] - me[1]);
-        if (d >= best || fabsf(q[2] - me[2]) >= 2.5f) continue;
-        uint32_t h = ((uint32_t)*(uint16_t*)e << 16) | (uint32_t)i;
-        if (t == 0 && f_seat_count(G, h) <= 0) continue;                             // a biped: the Mantis has seats
-        best = d; veh = h;
+        if (d < best && fabsf(q[2] - me[2]) < 2.5f) { best = d; veh = ((uint32_t)*(uint16_t*)e << 16) | (uint32_t)i; }
     }
     return veh;
 }
@@ -581,24 +548,31 @@ static void f_interaction(uint8_t* tls, uint8_t* act, uint8_t* unit, uint32_t b,
     *(uint32_t*)(act + 0x6C) = pick;
 }
 
+// Halo 4's use target (Dominion's terminals). A person's action carries what his view rests on in the interaction slots
+// (+0x64, +0x70, +0x7C: u16 type, the object at +8), set by the game's own targeting before his Use. Aimed at a terminal
+// (the owner's input logs, Nov 10, three terminals in two matches): slots 0 and 2 hold type 7 and the terminal's handle
+// (+0x64 7, +0x6C handle, +0x7C 7, +0x84 handle), slot 1 none (+0x78 NONE); idle they are 0 and NONE. A bot's action is
+// the player's as the template and nothing set its own target, so its Use (down 5 s, 0.5 u from a terminal) took
+// nothing (MCC's report: Captured 0 for every bot, 3 for the person). The brain sends the terminal's handle in
+// hb_shared.use_target[slot]; it stands in the slots from then on, like a person's target before his press. A handle
+// that is not a live object is ignored (the template's slots stay)
+static void f_use_target(uint8_t* tls, uint8_t* act, uint32_t handle) {
+    if (!handle || handle == 0xFFFFFFFFu || !f_object(tls, handle)) return;
+    *(uint32_t*)(act + 0x64) = 7;
+    *(uint32_t*)(act + 0x68) = 0;
+    *(uint32_t*)(act + 0x6C) = handle;
+    *(uint32_t*)(act + 0x70) = 0;
+    *(uint32_t*)(act + 0x74) = 0;
+    *(uint32_t*)(act + 0x78) = 0xFFFFFFFFu;
+    *(uint32_t*)(act + 0x7C) = 7;
+    *(uint32_t*)(act + 0x80) = 0;
+    *(uint32_t*)(act + 0x84) = handle;
+}
+
 // decoded live in H2A with tools/h2_action_record.py: +0 1, +4 life counter, +0x08 control
 // flags (jump 0x2), +0x0C fire (2 while the trigger is down), +0x10 yaw, +0x14 pitch, +0x1C
 // throttle forward, +0x20 throttle left, +0x38 trigger, +0x40 action (E 0x400000), +0x48
 // weapon set / +0x4A primary / +0x4B secondary index (unit +0x638), +0xE0 input history
-// a seated bot's cycle press switches its vehicle's weapon (a Banshee's cannons <-> bomb): the vehicle's own weapon
-// request (+0x63C: set u16, primary u8, secondary u8) to the other one. The cycle button in the action switched
-// nothing for a bot (live Ragnarok Nov 7: the Banshee's +0x638 stayed 01 00 00 ff, its shots cannon bolts); written
-// here the Banshee switched (01 00 01 ff) and the trigger fired storm_banshee_bomb_launcher_bomb, and back (01 00 00
-// ff, cannon bolts). ponytail: two weapons (0 <-> 1), the Banshee's; the brain cycles nothing else (Bot.fuel_rod)
-static void f_vehicle_cycle(h4f_game& G, uint8_t* tls, int index) {
-    uint8_t* unit = f_object(tls, *(uint32_t*)(f_player(tls, index) + 0x2C));
-    uint8_t* v = unit ? f_object(tls, *(uint32_t*)(unit + 0x24)) : nullptr;
-    if (!v) return;
-    uint8_t& primary = v[G.weapon_index + 2];
-    primary = primary == 0 ? 1 : 0;
-    logf("%s bot %d cycles its vehicle's weapon to %d", G.tag, index, primary);
-}
-
 static void f_fill(h4f_game& G, uint8_t* tls, uint8_t* act, int index, const hb_action& a) {
     uint8_t* unit = f_object(tls, *(uint32_t*)(f_player(tls, index) + 0x2C));
     *(int32_t*)act = 1;
@@ -616,10 +590,6 @@ static void f_fill(h4f_game& G, uint8_t* tls, uint8_t* act, int index, const hb_
     *(float*)(act + 0x1C) = a.forward;
     *(float*)(act + 0x20) = a.strafe;
     *(float*)(act + 0x38) = (b & HB_BTN_FIRE) ? 1.0f : 0.0f;
-    // the second trigger (a vehicle's second weapon: the Mantis's rockets, a Banshee's bomb): +0x3C, as Reach's action
-    // has it. Decoded live in Halo 4 Nov 7 (tools/decode_buttons.py fire2=rmb: +0x3C 1.0 and +0x08 0x80000 while held;
-    // the bit comes from maps/_inputs/h4.json "fire2", after this)
-    if (G.id == 7) *(float*)(act + 0x3C) = (b & HB_BTN_FIRE2) ? 1.0f : 0.0f;
     // the whole word: the player's action is the template, and its high half holds his presses (+0x40 bit 34, Halo
     // 4's sprint press, toggled every bot's sprint whenever he pressed Shift)
     *(uint64_t*)(act + 0x40) = (b & HB_BTN_ACTION) ? 0x400000u : 0u;
@@ -658,7 +628,6 @@ static void f_own_ids(uint8_t* p, int index) {
 // one command from the brain (shared.h cmd): add a bot, set a loadout
 static void f_command(h4f_game& G, uint8_t* tls) {
     if (g_shm->cmd_seq == g_shm->cmd_done_seq || !(g_shm->cmd_arg & (1 << G.cmd_bit))) return;
-    if (g_film_tick != ~0u) film_command(g_film_tick);    // each one as it is taken, the first tick's many too
     g_shm->cmd_fault = 0;
     __try {
         g_shm->cmd_result = g_shm->cmd == HB_CMD_ADD_BOT ? f_add_bot(G, tls, g_shm->cmd_arg)
@@ -695,58 +664,44 @@ static void f_prejoin(h4f_game& G, uint8_t* tls) {
 static void f_update(h4f_game& G, uint8_t* actions) {
     if (!g_shm) return;
     g_shm->game_tick++;
+    g_shm->game = (uint32_t)G.id;
     __try {
         uint8_t* tls = f_tls(G);
-        if (!tls) { g_shm->game = (uint32_t)G.id; return; }
-        // a Theater film first (before the game id, which starts the brain: botcore.cpp), then this tick's input: frozen
-        // and recorded in a live match, from the match's recording in its film (film.cpp). The brain added its 15 bots
-        // into a Halo 4 film and MCC crashed 2.6 s in (Ragnarok, Nov 7 09:17)
+        if (!tls) return;
         static DWORD last_call[8];                    // ticks come 60 a second while a match runs: a gap is a new match
         bool first = GetTickCount() - last_call[G.id & 7] > 3000;
-        const f_film_at& F = F_FILM[G.id == 7];
-        uint8_t* gg = F.slot ? *(uint8_t**)(tls + F.slot) : nullptr;
-        uint32_t tick = gg ? *(uint32_t*)(gg + F.ticks) : 0;
-        const film_frame* fr = nullptr;
-        if (gg) {
-            static uint64_t key[8];                   // hashed once a match (or film): its options do not change
-            if (first || !key[G.id & 7]) key[G.id & 7] = film_hash(gg + F.key_at, F.key_len);
-            g_playback = *(uint32_t*)(gg + F.play) != 0;
-            fr = film_tick(key[G.id & 7], tick, g_playback != 0, 0);   // (its commands: film_command in f_command)
-        }
-        g_film_tick = fr && !g_playback ? tick : ~0u;
-        g_shm->game = (uint32_t)G.id;
         if (first && (G.id == 6 || G.id == 7)) {
             // and the match's own clock near zero (player +0xA94 H2A, +0xA8C Halo 4, 60 a second: brain/live.py LiveH4F
             // MATCH), so a pause or a stall later in a match never holds a tick. Halo 4 too: Flood picks its first round's
             // Flood from the players there at the start; the bots joined 0.3-8 s later, so the first round had none and
-            // the game ended it at once (three Flood games, Nov 4: all 16 removed at full health ~14.7 s,
+            // the game ended it at once (the owner's three Flood games, Nov 4: all 16 removed at full health ~14.7 s,
             // no Flood all round 1, two in round 2)
             int clock = f_player(tls, 0) ? *(int32_t*)(f_player(tls, 0) + (G.id == 6 ? 0xA94 : 0xA8C)) : -1;
-            bool hold = g_prejoin && g_shm->bots_enabled && !g_playback && clock >= 0 && clock < 60 && !f_any_bot(tls);
+            bool hold = g_prejoin && g_shm->bots_enabled && clock >= 0 && clock < 60 && !f_any_bot(tls);
             logf("%s first tick: match clock %d, %s", G.tag, clock, hold ? "holding for the bots" : "not held");
             if (hold) f_prejoin(G, tls);
         }
         last_call[G.id & 7] = GetTickCount();
         f_command(G, tls);
-        while (film_more(tick)) f_command(G, tls);       // a film: the rest of this tick's commands, in turn
         uint64_t& mask = *(uint64_t*)(actions + 8);
         if (mask & 1) {                                   // the player's action, for decoding
             memcpy(g_shm->dbg_action, actions + 0x10, F_ACTION);
             g_shm->dbg_seq++;
         }
         for (int i = 0; i < HB_MAX_PLAYERS; i++) {
-            int index = fr ? fr->index[i] : g_shm->bot_player_index[i];    // this tick's input, frozen (film.cpp)
+            int index = g_shm->bot_player_index[i];
             if (index >= 0 && f_live(tls, index)) {
                 *(uint32_t*)(f_player(tls, index) + 4) |= 1;
                 f_own_ids(f_player(tls, index), index);
             }
-            const hb_action& a = fr ? fr->act[i] : g_shm->actions[i];
+            const hb_action& a = g_shm->actions[i];
             if (index < 0 || !a.seq || !f_live(tls, index)) continue;
             uint8_t* act = actions + 0x10 + (size_t)index * F_ACTION;
             mask |= 1ull << index;
             if (g_shm->h2_raw_valid == 2) { memcpy(act, g_shm->h2_raw_action, F_ACTION); continue; }
             if (mask & 1) memcpy(act, actions + 0x10, F_ACTION);    // the player's as the template
             f_fill(G, tls, act, index, a);
+            if (G.id == 7) f_use_target(tls, act, g_shm->use_target[i]);     // v14: a terminal's target (above)
             hb_apply_buttons(g_shm, (uint32_t)G.id, act, F_ACTION, a.buttons, G.map_prev[i]);   // v8 (shared.h)
             if (G.id == 6 && index < HB_MAX_PLAYERS * 2 && g_hold_obj[index])
                 *(uint64_t*)(act + 0x40) |= H2A_USE;      // a held pickup (f_interaction): Use stays down till it is in hand
@@ -759,9 +714,6 @@ static void f_update(h4f_game& G, uint8_t* actions) {
                 uint8_t* u = f_object(tls, *(uint32_t*)(f_player(tls, index) + 0x2C));
                 if (u) memcpy(act + 0x48, u + G.weapon_index, 4);
             }
-            // (Halo 4 only: there the cycle bit alone switched nothing, live; H2A's bit is not checked live yet, and
-            // switching here as well as by a bit that does would switch twice)
-            if (G.id == 7 && (a.buttons & HB_BTN_CYCLE) && !(G.map_prev[i] & HB_BTN_CYCLE)) f_vehicle_cycle(G, tls, index);
             G.map_prev[i] = a.buttons;
             __try { f_board(G, tls, index, a.buttons); }
             __except (EXCEPTION_EXECUTE_HANDLER) { logf("%s boarding faulted (bot %d)", G.tag, index); }

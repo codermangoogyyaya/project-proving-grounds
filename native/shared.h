@@ -38,9 +38,6 @@ enum : uint32_t {
                                 // Decoded table only (hb_apply_buttons): no build needed for it to reach the game
     HB_TARGET_SHIFT = 24,       // bits 24-28: the player index + 1 a sword / hammer / melee press locks onto (0 none): the
                                 // red reticle's target the game's lunge needs in the action (hb_target; issue #3)
-    HB_BTN_DEVICE = 1u << 29,   // with ACTION: this Use works the control device in reach (Reach: a generator's lockdown
-                                // switch, reach.cpp hr_near_control); without it a Use never does (Elite bots' pickup
-                                // presses locked generators for the Spartans, live Nov 8)
 };
 static inline int hb_target(uint32_t buttons) { return (int)((buttons >> HB_TARGET_SHIFT) & 31) - 1; }
 
@@ -159,53 +156,18 @@ struct hb_shared {
     float    spawn_at[HB_MAX_PLAYERS][4];
     uint32_t spawn_seq[HB_MAX_PLAYERS];
     uint32_t spawn_done[HB_MAX_PLAYERS];
-    // v13: ui_up (was chat_seq): 1 while the bug report window is open over a match (overlay.cpp), else 0.
-    // chat (Nov 8): the person's chat command for his teammate bots, never the text typed: chat[0] a count bumped per
-    // command (1-255, 0 none yet), chat[1] the command (HB_SAY_FOLLOW, HB_SAY_ROAM); the rest stays 0
-    uint32_t ui_up;
-    char     chat[64];
+    // v13: reserved (once a typed chat line; kept so the offsets after it stay put)
+    uint32_t chat_seq;
+    // v14: Halo 4's use target, by bot slot (the old chat line's 64 bytes, unused: the layout is the same size): the
+    // handle of the object a bot's view rests on for a Use (a Dominion terminal), 0 = none. botcore writes it into the
+    // action's interaction slots (h4f.cpp f_use_target), where a person's own action has it from the game's targeting
+    union {
+        char     chat[64];                       // (nothing reads it)
+        uint32_t use_target[HB_MAX_PLAYERS];
+    };
 };
 #pragma pack(pop)
 static_assert(sizeof(hb_shared) == 3622, "shared memory layout changed: update tools/botctl.py (SIZE, OFF_*)");
-
-// Chat commands for the person's teammate bots (overlay.cpp chat_key): "follow me" (they squad up with him) and "roam"
-// (they pick their own spots, out of the open). MCC's own chat is never read; the letters typed reach MCC's window
-// first. A line is the burst typed before Enter (a pause over HB_CHAT_GAP ms starts a new one: walking keys pressed
-// before the chat opened are not in it), Backspace takes one back, Esc throws it away. Only a command word leaves this:
-// any other line is dropped as it ends, never kept or logged (no key logging in what ships).
-enum { HB_SAY_NONE = 0, HB_SAY_FOLLOW = 1, HB_SAY_ROAM = 2 };
-static const uint32_t HB_CHAT_GAP = 1500;
-struct hb_chat_line { char buf[64]; int n; uint32_t last; };
-// feed each typed character c (WM_CHAR; Esc as 27) with its time in ms; returns the command a line ended with, else 0
-static inline int hb_chat_feed(hb_chat_line* s, uint32_t c, uint32_t ms) {
-    if (c == 27) { s->n = 0; return HB_SAY_NONE; }
-    if (c == '\r') {
-        char t[64]; int n = 0;
-        for (int k = 0; k < s->n; k++) {                 // lower case, spaces squeezed, ends trimmed
-            char ch = s->buf[k];
-            if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
-            if (ch == ' ' && (n == 0 || t[n - 1] == ' ')) continue;
-            t[n++] = ch;
-        }
-        while (n && t[n - 1] == ' ') n--;
-        t[n] = 0;
-        memset(s, 0, sizeof *s);                         // (the line is gone either way)
-        // the command, with at most two stray letters before it (the key that opened the chat box)
-        static const struct { const char* w; int cmd; } CMDS[] = { {"follow me", HB_SAY_FOLLOW}, {"roam", HB_SAY_ROAM} };
-        for (const auto& c2 : CMDS) {
-            int wn = (int)strlen(c2.w);
-            if (n >= wn && n - wn <= 2 && !strcmp(t + n - wn, c2.w))
-                return c2.cmd;
-        }
-        return HB_SAY_NONE;
-    }
-    if (c == 8) { if (s->n) s->n--; return HB_SAY_NONE; }
-    if (c < 32 || c > 126) return HB_SAY_NONE;
-    if (ms - s->last > HB_CHAT_GAP) s->n = 0;
-    s->last = ms;
-    if (s->n < 63) s->buf[s->n++] = (char)c;
-    return HB_SAY_NONE;
-}
 
 // v12: is a bot's unit moved to its spawn target this tick (reach.cpp hr_spawn_moves; tests/test_spawn_take.cpp)? A new
 // unit (not none, not last tick's) with a target sent since the last one taken. While the bot is dead the target waits;
