@@ -25,23 +25,26 @@ from brain.tracefmt import (Everyone, blitz_rows, call_lines, crosshair, meta_li
 from brain.maps import get_map, terrain as map_terrain, save_learned, grow as map_grow, swap as map_swap  # noqa: E402
 from brain.bot import Bot  # noqa: E402
 from brain import vehicles as V  # noqa: E402
-from brain import firefight as FF  # noqa: E402
 from brain.director import Director  # noqa: E402
 from brain.loadouts import Palette, liked_guns, record_death, want_slot  # noqa: E402
 from brain.profiles import make_profile  # noqa: E402
 from brain import scaling  # noqa: E402
 from brain.live import Live, LiveH2, LiveH3, LiveReach, LiveODST, LiveH4F, WEAPON_ALIAS  # noqa: E402
-from brain.invasion import layout as invasion_layout, Watch, clear_barriers, honor_spawn, honor_spawns, \
-    ally_spot as invasion_ally_spot, mate_clear as invasion_mate_clear, SPAWN_CLEAR  # noqa: E402
+from brain.invasion import layout as invasion_layout, Watch, phase_from_spawns, clear_barriers, honor_spawn, honor_spawns, \
+    ally_spot as invasion_ally_spot, mate_clear as invasion_mate_clear, res_zone_spawn as invasion_res_zone_spawn, \
+    SPAWN_CLEAR, res_summary as invasion_res_summary, res_zone_pick as invasion_res_zone_pick, \
+    free_vehicles as invasion_free_vehicles  # noqa: E402
 from brain.modes import Watch as ModeWatch, OBJECT_MODES, mode_of, stands_by_spawn  # noqa: E402
+from brain import dom_base  # noqa: E402
 import botctl  # noqa: E402
+from brain.firefight_spawns import RoundWatch as FirefightRoundWatch  # Firefight-only round boundary
+from brain.firefight_spawns import spawn_check as ff_spawn_check  # noqa: E402
 
 HZ = 30
 MAX_DT = 4 / HZ      # the longest step the bots think with: a longer gap (a hitch) is not made up in one step
 PAUSE_TICKS = 9      # loop passes (0.3 s) with botcore's game tick standing still: the game is paused
 
 
-DEF_REC_R = 35.0     # u: a person this near his flag at home is defending it (Passive LiDAR ctf_defend, director.defend_posts)
 MAP = None   # set in main() from --map
 
 
@@ -84,136 +87,7 @@ def think_dt(elapsed):
 BOT_CROUCH = ("ce", "h3", "h4")
 
 
-def horn_call(now, players, vehicles, person, horn):
-    """{vehicle handle: bot id or None} the person's horn calls this tick (requested Nov 6: aimed at a bot, the horn
-    calls it in): a press at the wheel (not a gun seat) picks the teammate bot on foot nearest the person's view line
-    within HORN_CONE and HORN_R (None: nobody there, director.honk_orders takes the nearest), and the call holds
-    HORN_HOLD s or until the person leaves the wheel. horn: botctl.owner_horn (None: not decoded here)."""
-    p = next((q for q in players if q.id == person and q.alive), None)
-    v = next((x for x in vehicles if p is not None and x["handle"] == p.vehicle), None)
-    at_wheel = v is not None and not p.gunner_seat
-    if at_wheel and horn and not HORN["down"]:
-        cands = []
-        for q in players:
-            if q.is_bot and q.alive and q.team == p.team and q.vehicle == -1:
-                d = math.hypot(q.pos.x - p.pos.x, q.pos.y - p.pos.y)
-                off = abs((math.atan2(q.pos.y - p.pos.y, q.pos.x - p.pos.x) - p.yaw + math.pi) % (2 * math.pi) - math.pi)
-                if 0.5 < d < HORN_R and off < HORN_CONE:
-                    cands.append((off, d, q.id))
-        HORN["call"] = (v["handle"], min(cands)[2] if cands else None, now + HORN_HOLD)
-    HORN["down"] = bool(horn)
-    c = HORN["call"]
-    if c is None or not at_wheel or c[0] != v["handle"] or now > c[2]:
-        HORN["call"] = None if c is not None and (not at_wheel or now > c[2]) else c
-        return {}
-    return {c[0]: c[1]}
-
-
-SAY = {"seen": None}                 # the last chat command count read (botctl.said)
-SAY_WORD = {1: "follow", 2: "roam"}
-SAY_NOTICE = {"follow": ("FOLLOW ME", "Your bots squad up with you. Type roam to let them pick their own spots."),
-              "roam": ("ROAM", "Your bots pick their own spots, out of the open. Type follow me to call them back.")}
-
-
-def say_command(m, snap, directors, now):
-    """The person's chat command (overlay.cpp chat_key: "follow me" / "roam") to his team's director: (command, team) when
-    a new one came this tick, else None. A count from before the brain started is taken as seen, not acted on."""
-    count, cmd = botctl.said(m)
-    if SAY["seen"] is None or count == SAY["seen"]:
-        SAY["seen"] = count
-        return None
-    SAY["seen"] = count
-    word = SAY_WORD.get(cmd)
-    person = next((p for p in snap.players if not p.is_bot and p.name != "ai"), None)
-    if word is None or person is None:
-        return None
-    for d in directors.values():
-        if d.team == person.team:
-            d.say, d.roam_picks, d.next_roles = word, None, now      # (roles again at once)
-    botctl.notice(m, *SAY_NOTICE[word])
-    print(f"{now:.1f} chat command: {word} (team {person.team})", flush=True)
-    return word, person.team
-
-
-def ff_state(live, players, now):
-    """Firefight's state for the brain (brain/firefight.py): versus (players on both sides: Versus or Generator
-    Defense), the Spartans' lives, each team's side {team: 1 Spartans or 7 Elites} (they swap each turn), the enemies
-    of the Spartans left, the heat for the Spartans and its zone (guide 11 section 2.4)."""
-    side = {}
-    for p in players:
-        if p.name != "ai" and p.side in (FF.SPARTAN, FF.ELITE):
-            side.setdefault(p.team, p.side)
-    versus = len(set(side.values())) == 2
-    lives = (getattr(live, "ff_lives", lambda: None)() or [-1] * 8)[FF.SPARTAN]
-    spartans = {t for t, s in side.items() if s == FF.SPARTAN}
-    foes = [p for p in players if p.alive and p.team not in spartans and (p.name == "ai" or p.side == FF.ELITE)]
-    npcs = [p for p in foes if p.name == "ai"]
-    ranks = [p.rank for p in npcs]
-    elites = sum(1 for r in ranks if "elite" in r)
-    h = FF.heat(squads_alive=len(FF.squads([(p.pos.x, p.pos.y) for p in npcs])),
-                big=any(any(k in r for k in FF.BIG) for r in ranks), elite_majority=bool(ranks) and elites > len(ranks) / 2,
-                player_elites=sum(1 for p in foes if p.name != "ai"), lives=lives,
-                unshielded=any(p.alive and p.team in spartans and p.name != "ai" and p.shield <= 0.0 for p in players),
-                power_weapon=any(p.alive and p.team in spartans and p.weapon in FF.POWER
-                                 for p in players))
-    out = dict(versus=versus, lives=lives, side=side, left=len(npcs), heat=h, zone=FF.heat_zone(h))
-    # (the match clock, as snap.time: a wall clock here put lock_t ~1.8e9 s ahead of the bots' snap.time, so after
-    # the first lock the 10 s gap never passed again, one lock a match, live Beachhead Nov 8)
-    out.update(gen_state(live, snap_time=now))
-    if any(g["hit"] for g in out["gens"]):          # (a generator taking damage: the heat's +0.10 term)
-        out["heat"] = min(1.0, h + 0.10)
-        out["zone"] = FF.heat_zone(out["heat"])
-    return out
-
-
-GENS = {"t": 0.0, "list": [], "hist": {}, "state": {}, "lock_t": -99.0}
-
-
-def gen_state(live, snap_time):
-    """Generator Defense's generators for the brain (brain/live.py ff_generators), read every 0.5 s: each one's place
-    (Vec), health 0..1, alive (health 0 never seen since it was last ready), ready (its lockdown switch on: it can be
-    locked), locked (every switch off while alive: 30 s untouchable), its state ("ready", "locked", "cool" the few
-    seconds after a lock, "disabled", "dead"), since when, hit (health down in the last 2 s); lock_t: when the last one
-    left "ready" alive (a lock: the team's one-lock-per-10-s rule, brain/firefight.py)."""
-    if not hasattr(live, "ff_generators"):
-        return {"gens": [], "lock_t": -99.0}
-    now = snap_time
-    if now - GENS["t"] >= 0.5:
-        GENS["t"] = now
-        try:
-            raw = live.ff_generators()
-        except Exception:
-            raw = []
-        out = []
-        for k, g in enumerate(raw):
-            hist = GENS["hist"].setdefault(g["handle"], [])
-            hist.append((now, g["health"]))
-            del hist[:-8]
-            on = [n for n, v in g["sw"].items() if v > 0.5]
-            dead = GENS.setdefault("dead", set())
-            if g["health"] <= 0.01:
-                dead.add(g["handle"])                 # (gone: its damage reads 0 again and every switch off after)
-            elif "gen" in on:
-                dead.discard(g["handle"])             # (a new turn's generator, ready again)
-            g["alive"] = g["handle"] not in dead
-            # live Beachhead Nov 8 (logs/tmp/gen_run4.txt): ready ("gen" on) -> locked (every switch off, the damage back
-            # to 0) for 30 s -> "cool" on a few seconds -> ready
-            state = ("dead" if not g["alive"] else "ready" if "gen" in on else "cool" if "cool" in on else
-                     "disabled" if on else "locked")
-            was = GENS["state"].get(g["handle"])
-            if was is None or was[0] != state:
-                if was is not None and was[0] == "ready" and g["alive"]:
-                    GENS["lock_t"] = now
-                    print(f"generator {k}: {was[0]} -> {state} (health {g['health']:.2f})", flush=True)
-                GENS["state"][g["handle"]] = was = (state, now)
-            out.append(dict(i=k, pos=Vec(*g["pos"]), health=g["health"], alive=g["alive"], ready=state == "ready",
-                            locked=state == "locked", state=state, since=was[1],
-                            hit=any(h - g["health"] > 0.01 for t, h in hist if now - t <= 2.0)))
-        GENS["list"] = out
-    return {"gens": GENS["list"], "lock_t": GENS["lock_t"]}
-
-
-def snapshot(live, now, prev, bot_ids, crouch=(), person_crouch=False, person_horn=None):
+def snapshot(live, now, prev, bot_ids, crouch=(), person_crouch=False):
     """crouch: the bots crouching (their last command); person_crouch: the person holds his crouch key (the games read
     no stance: crouched heads were shot over at standing height). ponytail: with more people on the machine's network
     the host's key is read for the first of them; their own stance needs the game's unit read."""
@@ -251,21 +125,6 @@ def snapshot(live, now, prev, bot_ids, crouch=(), person_crouch=False, person_ho
             rets.pop(t, None)
         rets.update(getattr(live, "live_returns", {}))
     for f in found:
-        if f.get("stand", f["team"]) not in MAP["flags"]:
-            # a flag of a team the map has no stand for (Halo 2 Containment Multi Flag: red's flag read as team 7, on
-            # stand 1, and the brain stopped on its first tick, live Nov 7): the team of the stand it is first seen on,
-            # kept for the match; none near a free stand: left out, the brain goes on
-            fix = MAP.setdefault("flag_team_fix", {})
-            if f["team"] not in fix:
-                taken = {g.get("stand", g["team"]) for g in found}
-                near = [t for t, q in MAP["flags"].items() if t not in taken and (Vec(*f["pos"]) - q).flat() < 2.0]
-                if near:
-                    fix[f["team"]] = near[0]
-                    print(f"{now:6.1f}s a flag read as team {f['team']} sits on team {near[0]}'s stand: taken as theirs",
-                          flush=True)
-            if f["team"] not in fix:
-                continue
-            f = dict(f, team=fix[f["team"]], stand=fix[f["team"]])
         home = MAP["flags"][f.get("stand", f["team"])]      # its own stand (One Flag: not its the player's side)
         pos = Vec(*f["pos"])
         state = "carried" if f["carrier"] is not None else ("home" if (pos - home).flat() < 1.0 else "dropped")
@@ -297,9 +156,7 @@ def snapshot(live, now, prev, bot_ids, crouch=(), person_crouch=False, person_ho
                                    # ability hides him like the camo powerup does
                                    equipment=d.get("equipment", ""), ability_on=on,
                                    # the match's motion tracker setting for him (off in SWAT)
-                                   tracker=d.get("tracker", True), side=d.get("side", 0),   # (side: Firefight)
-                                   head_pos=Vec(*d["head_pos"]) if d.get("head_pos") is not None else None,
-                                   view_pos=Vec(*d["view_pos"]) if d.get("view_pos") is not None else None,
+                                   tracker=d.get("tracker", True),
                                    camo_until=now + 0.3 if on and d.get("equipment") == "active_camo" else 0.0))
     bad = ability_misread(players, now)
     for p in players:
@@ -308,7 +165,7 @@ def snapshot(live, now, prev, bot_ids, crouch=(), person_crouch=False, person_ho
     # a vehicle riding on another (Reach: a Warthog's gun, a Falcon's side guns are their own vehicles, positioned
     # relative to it): its riders count as the carrier's, and it is not a vehicle of its own in the list (its gunner
     # read as riding a separate "unknown" vehicle, so every manned Warthog looked gunner-less)
-    objs = live.objects(getattr(live, "VEHICLE_TYPES", (1,)))   # (Halo 4: its giants too, the Mantis)
+    objs = live.objects((1,))
     parent_of = {}
     if hasattr(live, "object") and hasattr(live, "g"):
         for h, typ, path, pos in objs:
@@ -385,12 +242,8 @@ def snapshot(live, now, prev, bot_ids, crouch=(), person_crouch=False, person_ho
                                        and math.dist((q.pos.x, q.pos.y, q.pos.z), v["pos"]) < 8.0
                                        for q in players):
             honks.append(v["handle"])
-    honk_at = horn_call(now, players, vehicles, person, person_horn)
-    for hv in honk_at:
-        if hv not in honks:
-            honks.append(hv)
     snap = Snapshot(now, players, flags, mode="ctf" if flags else "slayer", vehicles=vehicles, honks=honks,
-                    honk_at=honk_at, ground_weapons=GROUND["list"], shieldless=now - live.shields_at > 3.0)
+                    ground_weapons=GROUND["list"], shieldless=now - live.shields_at > 3.0)
     if type(live).__name__ == "LiveH3":          # Halo 3's equipment out in the world (#9; Reach / H4 readers inherit
         try:                                     # LiveH3 but their object tables differ)
             snap.deployed = live.deployed(raw, now)
@@ -412,13 +265,19 @@ def snapshot(live, now, prev, bot_ids, crouch=(), person_crouch=False, person_ho
         snap.score = MATCH["v"]["score"] or (dict(TALLY) if TEAMS and snap.mode == "slayer" else snap.score)
         snap.score_limit, snap.time_left = MATCH["v"]["limit"], MATCH["v"]["time_left"]
     if FIREFIGHT:                                # the Covenant are the enemy: they join as players
+        # Reach: the Covenant AI are on the BLUE team (CAMPAIGN_AI_TEAM), whatever team number the game gives them: the
+        # bots read "same team" for them, so a bot on blue (the Covenant's side) never aims at, hunts or throws at them,
+        # and a bot or person on red fights them like any other enemy. The human-side AI (the Spartans' allies, the
+        # unit's side 1 or 2: live.ai_units "human") stay RED (HUMAN_AI_TEAM), with the Spartan players. ODST keeps its
+        # -1 (nobody's friend: its players may sit on any team number)
+        reach = isinstance(live, LiveReach)
         for d in live.ai_units(raw):
             fx, fy, fz = d["aim"]
-            players.append(PlayerState(d["index"], d["team"], "ai", Vec(*d["pos"]), Vec(),
+            ai_team = (HUMAN_AI_TEAM if d.get("human") else CAMPAIGN_AI_TEAM) if reach else d["team"]
+            players.append(PlayerState(d["index"], ai_team, "ai", Vec(*d["pos"]), Vec(),
                                        math.atan2(fy, fx), math.atan2(fz, math.hypot(fx, fy)), True,
-                                       d["shield"], d["health"], d["weapon"], rank=d.get("rank") or ""))
+                                       d["shield"], d["health"], d["weapon"]))
         snap.mode = "firefight"
-        snap.ff = ff_state(live, players, now)
     if engine == 4:                              # King of the Hill
         h = live.king_hill() or HILL.get("last")
         # (a King game always has a hill: a read that misses keeps the last one. Halo 3's comes from the host's HUD
@@ -495,10 +354,6 @@ GROUND = {"t": -1.0, "list": []}     # loose weapons, re-read twice a second
 MATCH = {"t": -1.0, "v": None}       # live.match_state(): score, limit, time left, twice a second
 HILL = {}                            # "last": the last King hill read (centre, radius), kept through missed reads
 HONK = {}                            # person id -> (vehicle, where it stopped, since when): the honk stand-in
-# the person's horn (botctl.owner_horn) at the wheel: the bot his view is on (within HORN_CONE of his facing, HORN_R off)
-# is called aboard, HORN_HOLD s (the director re-deals roles every pass); "down": the horn held last tick
-HORN = {"down": False, "call": None}  # call: (vehicle, bot id or None, until)
-HORN_CONE, HORN_R, HORN_HOLD = 0.26, 40.0, 10.0
 RIDE_ONLY = None                     # test override (--ride-only): the empty vehicles bots may take, by kind
 TALLY = {0: 0, 1: 0}                 # deaths counted as the other team's points (no score reader)
 
@@ -511,7 +366,9 @@ def unit_zoom(live, index):
     o = live.object(units[index]) if off is not None and index in units else None
     return live.g.read(o + off, 1)[0] if o else None
 TEAMS = True                         # set in main(): False in free for all
-FIREFIGHT = False                    # set in main: Reach Firefight (bots are the player's teammates)
+FIREFIGHT = False                    # set in main: Reach Firefight (bots play for red or blue, as in a multiplayer custom game)
+CAMPAIGN_AI_TEAM = 1                 # Reach Firefight: the Covenant AI are on this team (1 = blue)
+HUMAN_AI_TEAM = 0                    # ... and the human-side AI (the Spartans' allies) on this one (0 = red)
 
 
 def flag_events(directors, before, snap, now):
@@ -630,6 +487,7 @@ def spawn_check(send, bots, snap, now, state, spawns, watch, rng, T, trace=None)
     game puts it). watch.placed: the bots with a pick out (their spawns say nothing of the phase). A pick at a spawn
     kept for its vehicles (River in phases 2-3) gives the bot that vehicle as its errand (b.errand: handle, until)."""
     alive = sum(1 for p in snap.players if p.alive)
+    respawn_phase = watch.phase  # the real Invasion phase; snap.inv_phase may be 3 for an Assault objective
     # (not while a round's change is pending: invasion.Watch.round_wait_until, the half alive came while the rest were
     # still respawning and the picks by the old phase hid the new round, live Spire)
     ok = watch.sides_set and alive * 2 >= len(snap.players) and now >= getattr(watch, "round_wait_until", -1.0)
@@ -650,99 +508,105 @@ def spawn_check(send, bots, snap, now, state, spawns, watch, rng, T, trace=None)
         side = "att" if me.team == snap.inv_attackers else "def"
         pick = st.get("pick")
         on_mate = pick is not None and pick["mate"] is not None
-        if pick and st["phase"] == snap.inv_phase and not (on_mate and now - st["t"] >= 0.5):
+        if pick and st["phase"] == respawn_phase and not (on_mate and now - st["t"] >= 0.5):
             continue
         others = [q for q in taken if pick is None or q is not pick["pos"]]
-        mate = snap.player(pick["mate"]) if on_mate and st["phase"] == snap.inv_phase else None
+        mate = snap.player(pick["mate"]) if on_mate and st["phase"] == respawn_phase else None
         spot = invasion_ally_spot(mate, snap.players, T, others) \
             if mate is not None and invasion_mate_clear(mate, snap.players, T) else None
         errands = {e[0] for k, o in bots.items() if k != index and (e := getattr(o, "errand", None)) and now < e[1]}
         new = dict(pick, pos=spot, yaw=mate.yaw) if spot is not None else \
-            honor_spawn(spawns, snap.inv_phase, side, me, snap.players, rng, T, others, goal, snap.vehicles, errands)
+            honor_spawn(spawns, respawn_phase, side, me, snap.players, rng, T, others, goal, snap.vehicles, errands)
         if new is None:
             continue
         # spawned at River in phases 2-3 for the free Warthog or Falcon by it: sent to it (Bot.decide errand)
         b.errand = (new["ride"], now + 30.0) if new.get("ride") is not None else None
         send(index, new["pos"].x, new["pos"].y, new["pos"].z, new["yaw"])
         if trace and (pick is None or new["name"] != pick["name"]):
-            trace.write(json.dumps(dict(t=round(now, 3), id=index, spawn=new["name"], side=side, phase=snap.inv_phase,
+            trace.write(json.dumps(dict(t=round(now, 3), id=index, spawn=new["name"], side=side, phase=respawn_phase, objective_phase=snap.inv_phase,
                                         at=[round(new["pos"].x, 2), round(new["pos"].y, 2), round(new["pos"].z, 2)])) + chr(10))
         if pick is not None:
             taken = [q for q in taken if q is not pick["pos"]]
         taken.append(new["pos"])
-        st.update(pick=new, phase=snap.inv_phase, t=now)
+        st.update(pick=new, phase=respawn_phase, t=now)
     watch.placed = {index for index, st in state.items() if st.get("pick")}
 
 
-GUARD_ZONE_CLEAR = 8.0      # u: no enemy this near a respawn zone a guard is sent to
-GUARD_NEAR, GUARD_SLOW_S, GUARD_SLOW_COST = 8.0, 12.0, 30.0   # u at its post; s alive to get there; the slow zone's cost
-GUARD_SLOW = []             # (zone, post): a guard sent there was not at its post in GUARD_SLOW_S alive (this match)
-
-
-def guard_spawn_check(send, bots, snap, zones, state, rng, T, now, trace=None):
-    """Generator Defense (guide rule, Nov 8: guards go straight back to their generator after a
-    respawn): a dead guard (a Spartan bot on a Generator Defense defender order, director.ff_gen_slots) respawns at the
-    Firefight respawn zone nearest its generator with no enemy within GUARD_ZONE_CLEAR u, as a person picks one on the
-    death screen; a clear spot within 2 u of it, sent once a death (botctl.spawn_at: botcore moves its new unit there).
-    Live Beachhead: from the Spartan spawn the walk back took 20-30 s of every life."""
-    taken = [st["at"] for st in state.values() if st.get("at")]
+def res_spawn_check(send, bots, snap, now, state, inv, watch, rng, T, trace=None):
+    """Invasion respawns straight off the map's own Inv_res_zone hills (brain/invasion.py res_zone_spawn), for a
+    custom map with an Invasion setup of its own (inv_layout) but no inv_spawns.json of named spawns - Tempest:
+    "I only use Inv_res_zone on the hills because Inv_Res_ph1 to 3 don't work in customs". While a bot is dead,
+    where it will spawn, sent to botcore (send(index, x, y, z, yaw): botctl.spawn_at); its team's hill(s) for the
+    active phase, random among more than one (res_zone_spawn), facing the phase's objective. Picked once a death
+    and again in a new phase. Only with the sides known and half the players or more alive (as spawn_check)."""
+    alive = sum(1 for p in snap.players if p.alive)
+    # the real Invasion phase (watch.phase), as spawn_check uses: snap.inv_phase is the objective's phase and reads 3
+    # during an Assault/bomb run, and can lag, so p2/p3 hills were never picked
+    respawn_phase = watch.phase if watch.phase in (1, 2, 3) else (snap.inv_phase if snap.inv_phase in (1, 2, 3) else 1)
+    ok = watch.sides_set and alive * 2 >= len(snap.players) and now >= getattr(watch, "round_wait_until", -1.0)
+    zones = snap.inv_zones or []
+    goal = Vec(sum(z.x for z in zones) / len(zones), sum(z.y for z in zones) / len(zones),
+              sum(z.z for z in zones) / len(zones)) if zones else None
+    taken = [st["pos"] for st in state.values() if st.get("pos")]
+    claimed = set()                                    # vehicles sent for by a pick this tick
     for index, b in bots.items():
         me = snap.player(index)
         if not me:
             continue
         st = state.setdefault(index, {})
-        if me.alive:
-            # (judged by its walk from the zone: live Beachhead Nov 8, a guard sent onto a ledge over generator 1 its
-            # nav walks off, wedged at a rail 10 u from it 7 s while the generator went down, sent there again)
-            if st.get("zone") is not None:
-                st.setdefault("up", now)
-                if (me.pos - st["post"]).flat() <= GUARD_NEAR:
-                    st.clear()
-                elif now - st["up"] > GUARD_SLOW_S:
-                    GUARD_SLOW.append((st["zone"], st["post"]))
-                    if trace:
-                        trace.write(json.dumps(dict(t=round(now, 3), id=index, spawn="guard_slow",
-                                                    zone=[round(st["zone"].x, 2), round(st["zone"].y, 2)])) + chr(10))
-                    st.clear()
-            else:
-                st.clear()
-            continue
-        if st.get("up") is not None:                    # (died on its way: a new death, no verdict)
+        if me.alive or not ok:
+            if st.get("pos") and not me.alive:
+                send(index, math.nan, math.nan, math.nan, 0.0)
             st.clear()
-        o = b.order
-        if st.get("at") is not None:
             continue
-        why = ("not a guard order" if o.said != "gen" or o.role != "defender" or o.point is None else
-               f"side {me.side}" if me.side != FF.SPARTAN else None)
-        foes = [p.pos for p in snap.players if p.alive and p.team != me.team]
-        ok = [Vec(*z) for z in zones if all((q - Vec(*z)).flat() >= GUARD_ZONE_CLEAR for q in foes)]
-        why = why or (None if ok else f"no clear zone of {len(zones)}")
-        if why:
-            if trace and st.get("why") != why:            # (once a death and reason: tools/gen_report.py)
-                trace.write(json.dumps(dict(t=round(now, 3), id=index, spawn="guard_skip", why=why)) + chr(10))
-            st["why"] = why
+        # The scenario's hill labels describe attacking/defending roles, not the
+        # players' persistent game-team IDs. Those roles swap between Invasion rounds.
+        side = "att" if me.team == snap.inv_attackers else "def"
+        # the map's Inv_res_p team for this player: read off where the game itself respawned its team at the round's
+        # start (watch.res_label); only without that, the attackers/defenders bookkeeping
+        read = getattr(watch, "res_label", {}).get(me.team)
+        layout_team = read if read is not None else (inv["attackers"] if side == "att" else inv["defenders"])
+        if (st.get("pos") is not None and st.get("phase") == respawn_phase
+                and st.get("side") == side and st.get("team") == layout_team):
             continue
-        def cost(z):                                    # the nav's walk (its learned stuck spots in), not the crow's
-            w = T.walk_cost(z, o.point) if hasattr(T, "walk_cost") else math.inf
-            w = w if math.isfinite(w) else 2.0 * (z - o.point).flat()   # (a zone off the nav: the floor is still there)
-            slow = any((z - zs).flat() < 0.5 and (o.point - p).flat() < GUARD_NEAR / 2 for zs, p in GUARD_SLOW)
-            return w + (GUARD_SLOW_COST if slow else 0.0)
-        c = min(ok, key=cost)
-        spot = c
-        for k in range(16):
-            r, a = (0.0, 0.0) if k == 0 else (rng.uniform(0.5, 2.0), rng.uniform(0.0, 2 * math.pi))
-            p = Vec(c.x + r * math.cos(a), c.y + r * math.sin(a), c.z)
-            if (T.ground_ok(p.x, p.y, p.z + 0.4, drop=1.0) and T.los(c, p)
-                    and all((q - p).flat() >= SPAWN_CLEAR for q in taken)):
-                spot = p
-                break
-        yaw = math.atan2(o.point.y - spot.y, o.point.x - spot.x)          # facing its generator
-        send(index, spot.x, spot.y, spot.z, yaw)
-        st.update(at=spot, zone=c, post=o.point)
-        taken.append(spot)
-        if trace:
-            trace.write(json.dumps(dict(t=round(now, 3), id=index, spawn="guard", at=[round(spot.x, 2), round(spot.y, 2),
-                                        round(spot.z, 2)], gen=[round(o.point.x, 2), round(o.point.y, 2)])) + chr(10))
+        others = [q for q in taken if q is not st.get("pos")]
+        # the objective steers the pick (attackers: later spawns more often; defenders: the nearest to what they guard);
+        # going back a spawn is for a free vehicle only (brain/invasion.py res_zone_pick)
+        errands = {e[0] for k, o in bots.items() if k != index and (e := getattr(o, "errand", None)) and now < e[1]} | claimed
+        rides = invasion_free_vehicles(getattr(snap, "vehicles", None) or (), errands)
+        picked = invasion_res_zone_pick(inv, layout_team, respawn_phase, rng, others, side == "att", rides)
+        pos, ride = picked if picked is not None else (None, None)
+        if pos is None:
+            key = (layout_team, respawn_phase)
+            if key not in res_spawn_check.warned:
+                res_spawn_check.warned.add(key)
+                print(f"{now:6.1f}s res spawn: no Inv_res_p{respawn_phase} marker or usable Inv_res_zone hill for respawn team {layout_team}; "
+                      f"those bots spawn where the game puts them", flush=True)
+            continue
+        yaw = math.atan2(goal.y - pos.y, goal.x - pos.x) if goal is not None else 0.0
+        send(index, pos.x, pos.y, pos.z, yaw)
+        if ride is not None:                            # a free vehicle by this spawn: the bot goes for it (Bot.decide errand)
+            b.errand = (ride, now + 30.0)
+            claimed.add(ride)
+        if st.get("pos") is None or (pos - st["pos"]).flat() > 0.01:
+            print(f"{now:6.1f}s res spawn: bot {index} (player team {me.team}, {side}, respawn team {layout_team}"
+                  f"{'' if read is not None else ' [guessed]'}) -> "
+                  f"{'Inv_res_p' + str(respawn_phase) if any(pos is q for q in inv.get('res_named', {}).get(layout_team, {}).get(respawn_phase, [])) else 'Inv_res_zone hill'}"
+                  f" (phase {respawn_phase}) at ({pos.x:.2f}, {pos.y:.2f}, {pos.z:.2f})"
+                  f"{'' if ride is None else f', free vehicle {ride} by it'}", flush=True)
+        if trace and (st.get("pos") is None or (pos - st["pos"]).flat() > 0.01):
+            trace.write(json.dumps(dict(t=round(now, 3), id=index, spawn="res_zone",
+                                        side="att" if me.team == snap.inv_attackers else "def",
+                                        phase=respawn_phase, objective_phase=snap.inv_phase,
+                                        at=[round(pos.x, 2), round(pos.y, 2), round(pos.z, 2)])) + chr(10))
+        if st.get("pos") is not None:
+            taken = [q for q in taken if q is not st["pos"]]
+        taken.append(pos)
+        st.update(pos=pos, phase=respawn_phase, side=side, team=layout_team)
+    watch.placed = {index for index, st in state.items() if st.get("pos")}
+
+
+res_spawn_check.warned = set()
 
 
 def zone_spawn_check(send, bots, snap, zone_of, state, rng, T, now, trace=None):
@@ -852,8 +716,7 @@ def buttons(a):
             ((a.weapon + 1) & 7) << 8 if a.weapon >= 0 else 0) | ((a.zoom & 3) << 12) | (
             ((a.seat + 1) & 15) << 14 if a.seat >= 0 else 0) | (1 << 18 if a.turret else 0) | (   # shared.h HB_SEAT_SHIFT
             (1 if a.vertical > 0.75 else 3 if a.vertical > 0.25 else 2 if a.vertical < -0.25 else 0) << 19) | (  # HB_VERT_SHIFT
-            ((a.lunge_at + 1) & 31) << 24 if 0 <= a.lunge_at < 16 else 0) | (   # HB_TARGET_SHIFT: the lunge's target
-            botctl.BTN["device"] if a.device else 0)          # HB_BTN_DEVICE: this Use works a control (a lockdown)
+            ((a.lunge_at + 1) & 31) << 24 if 0 <= a.lunge_at < 16 else 0)   # HB_TARGET_SHIFT: the lunge's target
 
 
 # the ability readers (brain/live.py ability) are decoded statically, not yet checked live: a reading the game cannot
@@ -925,14 +788,13 @@ def main():
     ap.add_argument("--aim-loose", choices=("on", "off"), help="test: the looser trigger below Legendary on or off "
                     "for this match (brain/profiles.py LOOSE_AIM, the default)")
     o = ap.parse_args()
-    V.use_game(o.game)                       # this game's own vehicle seats (Halo 2's Scorpion and Wraith: no gunner)
     # Scaling difficulty (brain/scaling.py): one skill rating with no limit, set from the person's last Scaling games'
     # K/D; every bot on Scaling (its row on the BOTS list, else --tier) is made from it, both teams
     SCALE, SCALE_CFG = None, scaling.settings()
     panel = (botctl.roster(o.roster) or []) if o.roster else []
     if o.roster and o.ff_list:   # Firefight's own list (play.py), else the list's first 3 till it is saved (ff_seed)
-        ff_list = botctl.roster(o.roster, firefight=True, game=o.game)
-        panel = ff_list if ff_list is not None else panel[:botctl.FIREFIGHT_PLAYERS - 1]
+        ff_list = botctl.roster(o.roster, firefight=True)
+        panel = ff_list if ff_list is not None else panel[:botctl.player_cap(o.game, True) - 1]
     on_list = [b["tier"] for b in panel]
     if "scaling" in o.tier.split(",") + on_list:
         SCALE = scaling.update(n=scaling.games_window(o.roster) if o.roster else scaling.GAMES, cfg=SCALE_CFG)["play"]
@@ -955,22 +817,13 @@ def main():
     # Halo 4 / H2A: on their Forge canvases only (exported bare: tools/reach_export.py --h4 / --h2a); a built-in map's
     # game-type crates are its own placements there (tools/placed_refresh.py), not a layout
     canvas = o.game in ("h4", "h2a") and "forge" in MAP["name"]
-    if (o.game in ("reach", "h3") or canvas) and not FIREFIGHT:   # a Forge map variant: filed under its base map with a
-        try:                                  # navmesh of its own, its pieces read live and named by tag id
-            from brain.forge import live_pieces   # (brain/forge.py, brain/variants.py)
+    if (o.game == "reach" or canvas) and not FIREFIGHT:   # a Forge map variant: filed under its base map with a navmesh
+        try:                                  # of its own, its pieces read live and named by tag id (brain/forge.py,
+            from brain.forge import live_pieces   # brain/variants.py)
             from brain.variants import base_area, base_placed, identify
             pieces = live_pieces(live)
-            if o.game == "h3":                # Halo 3: its exports list no scenery, so a layout is the file placing the
-                from brain import mvar        # live Forge pieces (mvar.find_h3), filed with that file's pieces
-                import h3_forge_import
-                v, share = mvar.find_h3(MAP["name"], pieces)
-                got = h3_forge_import.file_one(v["path"], "h3") if v is not None else None
-                name = got[2] if got else MAP["name"]
-                print(f"Halo 3 map variant: {len(pieces)} live pieces, file "
-                      f"{os.path.basename(v['path']) + ' ' + repr(v['title']) if v else 'none'} ({share:.0%})", flush=True)
-            else:
-                name = identify(MAP["name"], pieces, base_placed(MAP["objects"]), game=o.game,
-                                area=base_area(MAP["objects"]))
+            name = identify(MAP["name"], pieces, base_placed(MAP["objects"]), game=o.game,
+                            area=base_area(MAP["objects"]))
             if name != MAP["name"] and o.game == "reach":
                 try:                                # its own .mvar file (brain/mvar.py): Forge labels, Invasion phases,
                     from brain import mvar          # kill boundaries, which the game's memory does not give
@@ -1006,19 +859,6 @@ def main():
                       f"{MAP['window']}", flush=True)
         except Exception as e:
             print("could not read the game's Forge pieces:", e, flush=True)
-    if o.game == "odst":
-        # its exported weapon spots are the campaign scenario's (h100: a sniper at 67.6, -50.7; Crater Firefight's lies in
-        # a weapon box at -32.6, -15.3): the power guns lying in this match instead, its boxes' too (GitHub #17)
-        try:
-            from brain.maps import POWER
-            vals = {n: v for n, kind, v in POWER.values() if kind == "weapon"}
-            found = [dict(name=n, kind="weapon", value=vals[n], pos=Vec(*p), respawn=45)
-                     for n, p in live.ground_weapons() if n in vals]
-            print(f"Firefight power guns lying in the match: {sorted(it['name'] for it in found)} (was "
-                  f"{sorted(it['name'] for it in MAP['items'] if it['kind'] == 'weapon')} from the export)", flush=True)
-            MAP["items"] = [it for it in MAP["items"] if it["kind"] != "weapon"] + found
-        except Exception as e:
-            print("could not read the guns lying in the match:", e, flush=True)
     if T is None:
         T = map_terrain(MAP)
     palette = Palette() if getattr(live, "LOADOUT", 0) else None   # Reach, Halo 4, H2A
@@ -1057,7 +897,7 @@ def main():
         return director_key(b, cur[0], o.ffa)
 
     from lidar import HumanWatch, RideWatch
-    people = HumanWatch(MAP["name"], T=T)    # Passive LiDAR: people's floor, deaths and landed jumps -> the map's (variant's) LiDAR data
+    people = HumanWatch(MAP["name"], T=T)    # people's floor, deaths and landed jumps -> the map's (variant's) LiDAR data
     # everyone's drives and flights -> the map's drive mesh and airspace (rides.json), applied to this match as saved
     rides, rides_new = RideWatch(MAP["name"], T=T), [False]
 
@@ -1071,6 +911,18 @@ def main():
             except Exception as e:
                 print(f"{what} not saved: {type(e).__name__}: {e}", flush=True)
     collector = None
+    if o.game == "h4":                 # each terminal's object handle, the use target a bot's Use needs (botctl.set_use_target)
+        n_targets = dom_base.load_use_targets(os.path.join(INPUTS, "h4_use_targets.json"), o.map)
+        print(f"use targets for {o.map}: {n_targets} terminal(s)" + ("" if n_targets else " (none: a bot's Use at a terminal has no target)"), flush=True)
+    owner_input = None                 # the person's own input block, for decoding a real E at a terminal (tools/input_log.py)
+    if o.game == "h4":
+        try:
+            from input_log import OwnerInput
+            owner_input = OwnerInput(os.path.join(ROOT, "logs", f"owner_input_{o.map}_{time.strftime('%Y%m%d-%H%M%S')}.jsonl"),
+                                     m, botctl)
+            print("owner input log on:", owner_input.path, flush=True)
+        except Exception as e:                       # never stops the bots
+            print(f"owner input log could not start: {type(e).__name__}: {e}", flush=True)
     from crouch_key import crouch_held
     try:
         crouch_now = crouch_held(live.g.pid)           # the person's crouch key held now (never saved)
@@ -1118,11 +970,11 @@ def main():
             print("game variant file not read:", e, flush=True)
     inv_layout = invasion_layout(MAP["objects"], styles=inv_styles) if (o.game == "reach" and not FIREFIGHT
                                                                         and not o.forge_invasion) else None
-    if inv_layout is not None:
-        inv_layout["map"] = MAP["name"]           # (its phase rules by map: brain/invasion.py phase_link_gates)
+    if o.game == "reach" and not FIREFIGHT and not inv_layout and getattr(invasion_layout, "reject", None):
+        print(f"Invasion setup NOT used (so no Inv_res_p respawns): {invasion_layout.reject}", flush=True)
     inv_watch, inv_check, inv_unread = [None], [-9.0], [False]
+    inv_trace_t = [-9.0]
     zone_check, zone_state = [-9.0], {}           # Invasion with no setup of its own: the game's zones (zone_spawn_check)
-    guard_check, guard_state = [-9.0], {}         # Generator Defense guards' respawn zones (guard_spawn_check)
     # a map variant's pieces that come and go (brain/forge.py PieceWatch): walls while they stand
     piece_watch, piece_check = None, [-9.0, 0]
     if MAP.get("variant") and not FIREFIGHT:
@@ -1131,6 +983,10 @@ def main():
         piece_watch = PieceWatch(pieces_of(MAP["variant"]), MAP["variant"].get("dynamic", ()),
                                  MAP["variant"].get("game") or o.game)
     inv_spawns, spawn_state = honor_spawns(MAP.get("base") or MAP["name"]) if inv_layout else None, {}
+    ff_spawn_pools, ff_spawn_state = None, {}
+    ff_round_watch = FirefightRoundWatch()
+    if FIREFIGHT and o.game == "reach":
+        print("Firefight: recording bots' initial team spawn positions", flush=True)
     mode_watch, mode_check = [None], [-9.0]      # Territories, Assault, Stockpile, Headhunter, Infection (brain/modes.py)
     bug_check, grow_check = [-9.0, None], [-9.0]     # bug_check[1]: the last tick's mode once read (see below)
     import bug_reports
@@ -1142,7 +998,7 @@ def main():
                 st = botctl.status(m)
                 oc = botctl.owner_crouch(m)             # H2A / Halo 4: his own action's crouch bit; elsewhere his key
                 snap = snapshot(live, now, prev, set(st["bots"].values()), {i for i, c in crouch_cmd.items() if c},
-                                oc if oc is not None else crouch_now(), person_horn=botctl.owner_horn(m))
+                                oc if oc is not None else crouch_now())
                 # the game paused (the pause menu: the player's bug notes held matches still 15-35 s): botcore's tick
                 # count (its per-tick game hook) stands still. The brain's clock stops with it, so nothing reads as
                 # stuck or waited out (the critic flagged bots "pushed into something" all through his pauses)
@@ -1220,12 +1076,16 @@ def main():
                         inv_watch[0] = Watch(inv_layout, T)
                         print(f"Invasion: attackers team {inv_layout['attackers']}, {len(inv_layout['barriers'])} "
                               f"barriers on the nav", flush=True)
+                        for line in invasion_res_summary(inv_layout):
+                            print(line, flush=True)
                     elif not on and inv_watch[0] is not None:
                         clear_barriers(T, inv_layout)
                         inv_watch[0] = None
                         oob.set_phase(T, None)
-                # (also on a map variant whose file gave the setup, brain/mvar.py, but no honor spawns are named)
-                if (inv_unread[0] or (inv_watch[0] is not None and not inv_spawns)) and now - zone_check[0] > 0.5:
+                # a map variant whose file gave no labelled Invasion setup at all (inv_layout None): only the game's
+                # own live-read zones are there to use (the engine's own Invasion respawn read, unreliable in
+                # customs - the res-zone fallback below needs the map's hills, which this map has none parsed)
+                if inv_unread[0] and now - zone_check[0] > 0.5:
                     zone_check[0] = now
                     try:
                         zone_spawn_check(lambda i, *a: botctl.spawn_at(m, i, *a), bots, snap, live.respawn_zone,
@@ -1235,8 +1095,28 @@ def main():
                         print(f"{now:6.1f}s zone spawns off ({type(e).__name__}: {e})", flush=True)
                 if inv_watch[0] is not None:
                     inv_watch[0].update(live, snap, now, getattr(live, "raw", None))
+                    # Diagnostic only: record the watcher's inputs so a wrong hill can be traced to either
+                    # phase detection or role/team mapping. This does not alter bot decisions.
+                    if trace and now - inv_trace_t[0] >= 1.0:
+                        inv_trace_t[0] = now
+                        w = inv_watch[0]
+                        recent = [(team, [round(p.x, 2), round(p.y, 2), round(p.z, 2)])
+                                  for _, team, p in w.spawns[-8:]]
+                        attacker_votes = [phase_from_spawns(w.inv, [(team, pos)])
+                                          for _, team, pos in w.spawns[-8:] if team == w.attackers]
+                        trace.write(json.dumps(dict(t=round(now, 3), invasion_watch=True,
+                                                    phase=w.phase, attackers=w.attackers,
+                                                    map_attackers=w.inv.get("attackers"),
+                                                    sides_set=w.sides_set, round_wait=round(w.round_wait_until, 2),
+                                                    phase_votes=attacker_votes, spawns=recent,
+                                                    score=getattr(snap, "score", None),
+                                                    score_base=getattr(w, "score_base", None),
+                                                    score_cap=getattr(w, "score_cap", None))) + chr(10))
                     oob.set_phase(T, inv_watch[0].phase)   # (its gates' kill volumes stand until their phase is taken)
-                    if inv_spawns:
+                    # Explicit Inv_res_p1..p3 map labels describe the respawn phase and take priority over
+                    # inv_spawns.json named offers. Otherwise retain the existing honor-spawn system unchanged.
+                    use_map_phase_res = bool(inv_layout.get("res_labelled"))
+                    if inv_spawns and not use_map_phase_res:
                         try:
                             spawn_check(lambda i, *a: botctl.spawn_at(m, i, *a), bots, snap, now, spawn_state, inv_spawns,
                                         inv_watch[0], rng, T, trace)
@@ -1245,14 +1125,37 @@ def main():
                             import traceback
                             print(f"{now:6.1f}s spawn picks off ({type(e).__name__}: {e}):", traceback.format_exc(limit=4),
                                   flush=True)
+                    else:
+                        # A map with its own Invasion setup and phase-labelled respawn flags (or no named-spawn
+                        # configuration) uses its map-authored team hills directly. Keep res_spawn_check's existing
+                        # attacker/defender-to-map-team mapping so round-two side swaps remain correct.
+                        try:
+                            res_spawn_check(lambda i, *a: botctl.spawn_at(m, i, *a), bots, snap, now, spawn_state,
+                                            inv_layout, inv_watch[0], rng, T, trace)
+                        except Exception as e:           # (never the whole tick: bots then spawn where the game puts them)
+                            import traceback
+                            print(f"{now:6.1f}s res-zone spawn picks off ({type(e).__name__}: {e}):",
+                                  traceback.format_exc(limit=4), flush=True)
                 elif o.game in ("reach", "h3", "h4", "h2a", "h2", "ce") and not FIREFIGHT and now - mode_check[0] > 5.0:   # the other objective modes (CE: Race)
                     mode_check[0] = now
                     mode = mode_of(o.game, live)
                     if mode in OBJECT_MODES and (mode_watch[0] is None or mode_watch[0].kind != mode):
                         mode_watch[0] = ModeWatch(mode, MAP["objects"], o.game)
+                        dom_base.reset()           # a new match / mode: no stale claims or cooldowns
                         print(f"game type: {mode}", flush=True)
                     elif mode not in OBJECT_MODES:
                         mode_watch[0] = None
+                if FIREFIGHT and o.game == "reach":
+                    try:
+                        if ff_round_watch.update(snap, now, bots):
+                            ff_spawn_state.clear()
+                            ff_spawn_pools = None
+                            print(f"{now:6.1f}s Firefight: round {ff_round_watch.round_number} detected; cleared old spawn pools", flush=True)
+                        ff_spawn_check(lambda i, *a: botctl.spawn_at(m, i, *a),
+                                       bots, snap, ff_spawn_state, ff_spawn_pools, rng, now, trace,
+                                       round_pending=ff_round_watch.pending)
+                    except Exception as e:
+                        print(f"{now:6.1f}s Firefight spawn picks failed ({type(e).__name__}: {e})", flush=True)
                 if mode_watch[0] is not None and inv_watch[0] is None:
                     mode_watch[0].update(live, snap, now, getattr(live, "raw", None))
                 if piece_watch is not None and now - piece_check[0] > 2.0:
@@ -1279,16 +1182,6 @@ def main():
                                      steering if p.id == 0 else None, p.vehicle != -1)
                                     for p in snap.players if p.id not in st["bots"].values() and p.name != "ai"])
                 rides.update(now, snap.vehicles, snap.players, set(st["bots"].values()))
-                if snap.mode == "ctf" and snap.flags:     # where people defend their flag (Passive LiDAR: defend_posts)
-                    for hp in snap.players:
-                        f = snap.flags.get(hp.team)
-                        if (hp.alive and not hp.is_bot and hp.id not in st["bots"].values() and not hp.has_flag
-                                and f is not None and f.state == "home" and 2.0 < (hp.pos - f.pos).flat() < DEF_REC_R):
-                            people.holding(now, "ctf_defend", (hp.pos.x, hp.pos.y, hp.pos.z))
-                if snap.mode == "oddball" and snap.ball_carrier is not None:   # where people hold the ball (Passive LiDAR)
-                    hp = snap.player(snap.ball_carrier)
-                    if hp is not None and hp.alive and not hp.is_bot and hp.id not in st["bots"].values():
-                        people.holding(now, "oddball", (hp.pos.x, hp.pos.y, hp.pos.z))
                 if rides_new[0]:                 # saved new rides: on this match's terrain now (main thread)
                     rides_new[0] = False
                     from brain.maps import data_names, rides_layers
@@ -1333,15 +1226,11 @@ def main():
                         bots[index].liked = liked_guns(me.name)   # its favourite loadout guns (brain/loadouts.py)
                         # Reach: botcore s67 fills the pickup itself (native/reach.cpp hr_loose_weapon); Halo 3 the
                         # same way as Halo 2. H2A / H4 pickups not decoded yet
-                        bots[index].can_pickup = o.game in ("ce", "h2", "h3", "reach", "odst")   # (ODST: native/odst.cpp od_pickup_target, #17)
+                        bots[index].can_pickup = o.game in ("ce", "h2", "h3", "reach")
                         # what reaches the game: botcore sends melee natively only in CE; the rest
                         # only where decoded (maps/_inputs); a bot plans with what it can press
                         names = {n for _, n, *_ in pressable}
                         bots[index].can_melee = o.game == "ce" or "melee" in names
-                        # a vehicle's other weapon (a Banshee's bomb) is cycled to: only where the cycle is decoded and
-                        # switches it (Halo 4: botcore's f_vehicle_cycle; Reach as before). Live Nov 7, a bot pilot: in
-                        # Halo 3 and H2A the cycle switched nothing (cannon bolts only); their bomb input is not decoded
-                        bots[index].can_cycle = "cycle" in names and o.game in ("reach", "h4")
                         bots[index].kit.pressable = "equipment" in names
                         # (Halo 4's sprint is botcore's own, s123: native/h4f.cpp f_sprint)
                         bots[index].kit.sprint_ok = "sprint" in names or o.game == "h4"
@@ -1357,15 +1246,6 @@ def main():
                     return Director(team, MAP, members, random.Random(hash(k) & 0xFFFF), log=comms,
                                     side=team % 2, home_rule=o.game in ("ce", "reach"))
                 regroup(directors, bots, snap, o.ffa, make)
-                said = say_command(m, snap, directors, now)
-                if said and trace:                      # (the command, never the text: tools/say_report.py)
-                    trace.write(json.dumps(dict(t=round(now, 3), say=said[0], team=said[1])) + chr(10))
-                for d in directors.values():            # (each roam pick and why: logs/tmp/roam_dig.py)
-                    ev = d.__dict__.get("roam_log") or []
-                    while ev:
-                        e = ev.pop(0)
-                        if trace:
-                            trace.write(json.dumps(dict(t=round(now, 3), roam=e, team=d.team)) + chr(10))
                 for d in directors.values():
                     if snap.infected != -1 and not TEAMS:   # Halo 3 Infection: one side each, survivors or infected
                         p = snap.player(next(iter(d.bots)))
@@ -1391,9 +1271,6 @@ def main():
                                  if not (isinstance(t, tuple) and t[0] == "bot")},
                         blitz=blitz_rows(directors),
                         crouch=[p.id for p in snap.players if p.crouching],   # (who reads crouched: aim heights)
-                        # Generator Defense (tools/gen_report.py): [i, state, health, x, y] each generator
-                        gens=[[g["i"], g["state"], round(g["health"], 2), round(g["pos"].x, 2), round(g["pos"].y, 2)]
-                              for g in (snap.ff or {}).get("gens", [])] or None,
                         world=everyone.rows(now, snap.players, bot_set, T.los, aims),   # + still, formed up, in sights,
                         # people's crosshairs and rides
                         deployed=[[d["kind"], round(d["pos"].x, 2), round(d["pos"].y, 2), round(d["pos"].z, 2), d["team"]]
@@ -1425,20 +1302,12 @@ def main():
                     save_learned(MAP)
                     # (on a thread: the merge and write of a big map's lidar.json froze every bot for a few ticks)
                     threading.Thread(target=save_lidar, daemon=True).start()
-                if FIREFIGHT and (snap.ff or {}).get("gens") and now - guard_check[0] > 0.5:
-                    guard_check[0] = now
-                    try:
-                        guard_spawn_check(lambda i, *a: botctl.spawn_at(m, i, *a), bots, snap, live.ff_zones(),
-                                          guard_state, rng, T, now, trace)
-                    except Exception as e:           # (never the whole tick: guards then spawn where the game puts them)
-                        guard_check[0] = float("inf")
-                        print(f"{now:6.1f}s guard spawns off ({type(e).__name__}: {e})", flush=True)
                 if now - last_items > 0.5:
                     last_items = now
                     item_check(live, directors, bots, snap, now)
                 # (no loadout asks in Infection / Flood: Halo 4 Flood took them, slots 3-4 handing survivors a DMR and a
-                # magnum where everyone else spawned with the shotgun, seen in a Ragnarok game as a survivor holding a
-                # DMR; the game's own loadout, as a person who picks none)
+                # magnum where everyone else spawned with the shotgun, the owner's Ragnarok game: "why did this guy have a
+                # DMR?"; the game's own loadout, as a person who picks none)
                 if palette and snap.mode == "infection":
                     for i, st in loadout_state.items():     # (asked before the mode was read: back to the game's own)
                         if st.get("asked") not in (None, 0) and botctl.set_loadout(m, i, 0, o.game):
@@ -1449,6 +1318,13 @@ def main():
                 dt = think_dt(now - last_think if last_think is not None else 0.0)
                 last_think = now
                 passes += 1
+                if owner_input:
+                    try:
+                        owner_input.tick(now)
+                    except Exception as e:
+                        print(f"owner input log stopped: {type(e).__name__}: {e}", flush=True)
+                        owner_input = None
+                locked = {}                                   # bots holding a Dominion base this pass (brain/dom_base.py)
                 for index, b in think_order(bots, passes):    # (the teams interleaved, the first swapping)
                     me = snap.player(index)
                     if not me or not me.alive:
@@ -1496,6 +1372,10 @@ def main():
                         d.report(t, index, kind, pos, enemy=eid, busy=busy)
                     b.reports.clear()
                     botctl.act(m, slots[index], a.forward, a.strafe, a.yaw, a.pitch, buttons(a))
+                    if dom_base.holds(index):
+                        locked[index] = (slots[index], a)
+                    if o.game == "h4":                 # the terminal this bot holds, its use target (0 without a claim)
+                        botctl.set_use_target(m, slots[index], dom_base.use_target(index))
                     last_yaw[index] = a.yaw
                     crouch_cmd[index] = a.crouch and o.game in BOT_CROUCH
                 for c in comms[said:]:
@@ -1509,7 +1389,14 @@ def main():
                         print(f"{now:6.1f}s bot {index} {b.p.tier[:3]} t{b.team} {me.pos.x:6.1f},{me.pos.y:7.1f} goal {b.goal[0]:<8} "
                               f"sh {me.shield:.2f} hp {me.health:.2f}" if me and me.alive else f"{now:6.1f}s bot {index} dead",
                               flush=True)
-                time.sleep(max(0.0, 1 / HZ - (time.time() - tick)))
+                # a bot holding a base has its command re-sent a few times inside the pass, so the game's tick never
+                # reads a stale or empty word between two passes (only those bots; everyone else as before)
+                end = tick + 1 / HZ
+                while locked and time.time() < end - 0.01:
+                    time.sleep(0.008)
+                    for slot, a in locked.values():
+                        botctl.act(m, slot, a.forward, a.strafe, a.yaw, a.pitch, buttons(a))
+                time.sleep(max(0.0, end - time.time()))
             except Exception as e:      # a read raced the game (object gone) or the match ended
                 fails += 1
                 err = f"{type(e).__name__}: {e}"      # (named `key` before: that replaced the key
@@ -1557,3 +1444,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
