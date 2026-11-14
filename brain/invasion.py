@@ -18,6 +18,7 @@ Phases are told apart live by where each team respawns (brain/invasion.py phase_
 import json
 import math
 import os
+import re
 
 from .core import Vec
 
@@ -38,6 +39,49 @@ def _centroid(pts):
     return Vec(sum(p.x for p in pts) / len(pts), sum(p.y for p in pts) / len(pts), sum(p.z for p in pts) / len(pts))
 
 
+def _num(v):
+    """Coerce a netgame flag's team/sequence value to int (it may arrive as an int, a float, or a numeric string
+    on custom/Forge maps), else None."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def res_phase_of(f):
+    """The phase (1-3) of an Inv_res_p1..p3 respawn marker, whatever the label's spelling (inv_res_p1, Inv_Res_P2,
+    inv_res_ph3, inv_res_phase1, "inv res p2"), else None."""
+    m = re.match(r"^inv[_ ]?res[_ ]?p(?:h|hase)?[_ ]?([123])$", str(f.get("type", "")).strip().lower())
+    return int(m.group(1)) if m else None
+
+
+def res_summary(inv):
+    """Console lines naming every respawn marker the map gave, per respawn team, at its exact XYZ: Inv_res_p1..p3 (their
+    phase only) and Inv_res_zone hills (from their spawn sequence's phase on)."""
+    def at(pts):
+        return ", ".join(f"({q.x:.2f}, {q.y:.2f}, {q.z:.2f})" for q in pts) or "none"
+    named, hills = inv.get("res_named", {}), inv.get("res_zone", {})
+    lines = ["Invasion respawns (a phase's pool = its Inv_res_p<phase> + Inv_res_zone hills of that sequence or earlier):"]
+    for team in sorted(set(named) | set(hills)):
+        for ph in (1, 2, 3):
+            lines.append(f"  respawn team {team}  Inv_res_p{ph} (phase {ph} only): {at(named.get(team, {}).get(ph, []))}")
+        for seq in (1, 2, 3):
+            use = "all phases" if seq == 1 else ("phases 2-3" if seq == 2 else "phase 3 only")
+            lines.append(f"  respawn team {team}  Inv_res_zone sequence {seq} ({use}): {at(hills.get(team, {}).get(seq, []))}")
+    return lines
+
+
+def _seq(f):
+    """A netgame flag's spawn sequence, under whichever key the map's data uses (Forge calls it "Spawn Sequence";
+    different exporters/parsers hand it back as "phase", "sequence", "spawn_sequence", or "seq")."""
+    for key in ("phase", "sequence", "spawn_sequence", "seq"):
+        if key in f:
+            value = _num(f[key])
+            if value is not None:
+                return value
+    return None
+
+
 def layout(objs, shapes=None, styles=None):
     """The map's Invasion setup, or None on a map without one:
     dict(attackers=team, defenders=team, phases={1: [territory Vec, ...], 2: [...], 3: [delivery Vec]},
@@ -45,7 +89,7 @@ def layout(objs, shapes=None, styles=None):
          or None, bomb_phase). styles: a custom variant's phase objectives (brain/mvar.py phase_styles, {phase:
          "assault" ...}): a map variant file's Assault phase has its bomb at that phase's inv_obj_flag."""
     flags = objs.get("netgame_flags", [])
-    of = lambda t: [f for f in flags if f["type"] == t]
+    of = lambda t: [f for f in flags if str(f.get("type", "")).lower() == t]
     goals = [_v(f["pos"]) for f in of("inv_objective")]
     # each objective's zone size from its boundary (tools/reach_export.py): a cylinder's radius, half a box's short
     # side (Boneyard's territories are boxes of 1.75 x 2.5: a bot 2 u off the marker stood outside)
@@ -56,18 +100,43 @@ def layout(objs, shapes=None, styles=None):
         zone_r.append((_v(f["pos"]), max(0.6, min(4.0, r or TERRITORY_R))))
     core = [_v(f["pos"]) for f in of("inv_obj_flag")]
     res = {}
+    named_res = {}
     # a map variant read from its file (brain/mvar.py) gives each object's spawn sequence as "phase": on Bungie's own
     # Boneyard and Breakpoint files inv_objective 1, 2, 3 are the phase 1 and 2 territories and the delivery point,
     # inv_obj_flag 3 the core's stand, 2 Breakpoint's bomb (DERIVED, haloreach/map_variants). Respawn zones: inv_res_zone
-    # by team and sequence where the map has them so (issue #2: custom maps use Inv_res_zone alone, as Inv_Res_ph1 to 3
-    # do not work in customs) when it has no inv_res_p1..p3 (Boneyard has both: its p1..p3 hold)
-    zoned = [] if any(of(f"inv_res_p{ph}") for ph in (1, 2, 3)) else [
-        f for f in of("inv_res_zone") if f.get("phase") in (1, 2, 3) and f["team"] in (0, 1)]
+    # by team and sequence where the map has them so (the issue #2 player: "I only use Inv_res_zone on the hills because
+    # Inv_Res_ph1 to 3 don't work in customs") when it has no inv_res_p1..p3 (Boneyard has both: its p1..p3 hold)
+    res_zone = of("inv_res_zone")
+    seqs = {s for s in (_seq(f) for f in res_zone) if s is not None}
+    # Forge's hill markers (label Inv_res_zone) number their Spawn Sequence from 0 on some custom/Forge World
+    # setups, from 1 (matching the phase, as on Bungie's own maps) on others; detect which and shift 0-based
+    # numbering up so it lines up with phases 1-3 either way.
+    shift = 1 if seqs and 0 in seqs and 3 not in seqs else 0
+    # every Inv_res_zone hill, grouped {team: {phase: [Vec, ...]}} - a backup source, kept alongside whatever
+    # inv_res_p1..3 flags the map has rather than switched on only when those are entirely absent: a custom map
+    # can label one team's zones with inv_res_p1..3 and the other's with Inv_res_zone hills, or a team can have
+    # more than one hill sharing a phase (the game offers either; a bot picks one at random, see res_zone_spawn)
+    backup = {}
+    for f in res_zone:
+        team, ph = _num(f.get("team")), _seq(f)
+        if team is None or ph is None or ph + shift not in (1, 2, 3):
+            continue
+        backup.setdefault(team % 2, {}).setdefault(ph + shift, []).append(_v(f["pos"]))
     for ph in (1, 2, 3):
-        for f in [f for f in zoned if f["phase"] == ph] if zoned else of(f"inv_res_p{ph}"):
-            res.setdefault(f["team"] % 2, {}).setdefault(ph, []).append(_v(f["pos"]))
+        for team_label in (0, 1):
+            named = [f for f in flags if res_phase_of(f) == ph and _num(f.get("team")) is not None
+                     and _num(f["team"]) % 2 == team_label]
+            named_pts = [_v(f["pos"]) for f in named]
+            if named_pts:
+                named_res.setdefault(team_label, {})[ph] = named_pts
+            pts = named_pts or backup.get(team_label, {}).get(ph, [])
+            if pts:
+                res.setdefault(team_label, {}).setdefault(ph, pts)
     if len(goals) < 3 or not core or len(res) < 2 or any(1 not in r for r in res.values()):
+        layout.reject = (f"inv_objective flags {len(goals)} (need 3), inv_obj_flag {len(core)} (need 1), respawn teams "
+                         f"with a phase 1 zone {sorted(t for t, r in res.items() if 1 in r)} (need both 0 and 1)")
         return None
+    layout.reject = None
     staged = {ph: [_v(f["pos"]) for f in of("inv_objective") if f.get("phase") == ph] for ph in (1, 2, 3)}
     staged = staged if all(staged.values()) else None
     # the attackers start farther from every objective (Boneyard: team 1 at x 220, the objectives at 250-310), from
@@ -134,52 +203,10 @@ def layout(objs, shapes=None, styles=None):
         kind = "one_way" if one_way else ("gate" if f["type"] in ("inv_gates", "inv_platform") else "solid")
         bars.append(dict(key=f"inv{k}", a=a, b=b, z0=p.z + z0, z1=p.z + z1, kind=kind, name=name, pos=p,
                          through=Vec(-fx, -fy, 0.0) if one_way else None))
-    # the phase's man cannons: an inv_mancannon spawns in its sequence's phase (Spire's three: 3, a Nov 6 playtest:
-    # phase 3 only); phase_link_gates closes the people's links off them before then
-    launchers = [(_v(f["pos"]), f.get("phase", f.get("seq"))) for f in flags if f.get("type") == "inv_mancannon"]
-    return dict(attackers=att, defenders=dfn, phases=phases, core=stand, res=res, barriers=bars, zone_r=zone_r,
-                bomb=bomb, bomb_phase=(bp if staged else 2) if bomb is not None else None, launchers=launchers)
-
-
-# the ways up to a phase 3 core on high (a Spire playtest, Nov 6 19:11-19:38: the attackers all funnelled
-# into one way up; 12 of 16 climbs went by lift 2): where each starts
-# (the playtest's places), the attackers' runners spread over them (director.assign_roles: the via of a runner)
-CLIMBS = {"reach_35_island": [(-172.15, -401.02, -62.49), (-177.67, -400.60, -62.38), (-142.14, -391.64, -53.68),
-                              (-161.15, -381.07, -57.29), (-191.63, -389.23, -57.24)]}   # lift 2, lift 1, cannons 1-3
-CLIMB_UP = 15.0           # u: a core this high over a climb's start is taken by one of them
-
-
-def climbs_for(map_name):
-    """CLIMBS for a map (its base map's for a variant), [] where none."""
-    return [Vec(*p) for p in CLIMBS.get((map_name or "").split("/")[0].split("@")[0], ())]
-
-
-# rides whose landing a phase changes (a Spire playtest Nov 6: in phase 2 every spire grav lift lands
-# on the lower building's roof, (-173.8, -399.3, -55.9); in phase 3 to the spire's top): {base map: [(take-off
-# x, y, within u, landing over z, from phase)]}: a people's link off that lift landing over that height is closed before
-LIFT_PHASES = {"reach_35_island": [(-177.67, -400.60, 3.0, -40.0, 3), (-172.15, -401.02, 3.0, -40.0, 3)]}
-LAUNCHER_R, LAUNCH_UP = 2.5, 5.0   # u: a people's link taking off this near a man cannon (flat, 3 u up or down) and
-                                  # climbing this much is its ride (not a hop off its pad)
-
-
-def phase_link_gates(T, inv, phase, map_name=None):
-    """Close the people's links (T.hjumps) the phase does not have: off a man cannon not spawned yet (inv launchers), up a
-    lift to a landing it only reaches later (LIFT_PHASES). Applied by Watch at each phase."""
-    rules = LIFT_PHASES.get((map_name or "").split("/")[0].split("@")[0], ())
-    closed = set()
-    for n, (f, t, k, w) in enumerate(getattr(T, "hjumps", ())):
-        to, ld = k.get("take_off"), k.get("land")
-        if not to or not ld:
-            continue
-        if ld[2] - to[2] >= LAUNCH_UP and any(
-                ph is not None and phase < ph and math.hypot(p.x - to[0], p.y - to[1]) < LAUNCHER_R and abs(p.z - to[2]) < 3.0
-               for p, ph in inv.get("launchers", ())):
-            closed.add(n)
-        elif any(phase < ph and math.hypot(x - to[0], y - to[1]) < r and ld[2] > zl for x, y, r, zl, ph in rules):
-            closed.add(n)
-    if hasattr(T, "set_link_gates"):
-        T.set_link_gates(closed)
-    return closed
+    return dict(attackers=att, defenders=dfn, phases=phases, core=stand, res=res,
+                res_named=named_res, res_zone=backup, res_labelled=bool(named_res),
+                barriers=bars, zone_r=zone_r,
+                bomb=bomb, bomb_phase=(bp if staged else 2) if bomb is not None else None)
 
 
 def zone_radius(inv, p):
@@ -220,6 +247,28 @@ def roles_from_spawns(inv, spawns, phase=1):
     return {t: sum(v) * 2 > len(v) for t, v in votes.items()}
 
 
+def labels_from_spawns(inv, spawns, phase=1):
+    """{player team: the respawn-zone label (0/1) it uses} from respawns [(team, Vec)] that are the game's own (a
+    round's opening spawns): each votes for the label whose zone is nearest. Ground truth for which team's Inv_res_p
+    markers a player team gets, whatever the round-swap bookkeeping says. {} unless both teams read clearly, and to
+    different labels."""
+    zones = {lb: (zs.get(phase) or zs.get(1) or []) for lb, zs in inv["res"].items()}
+    zones = {lb: zs for lb, zs in zones.items() if zs}
+    if len(zones) < 2:
+        return {}
+    votes = {}
+    for team, p in spawns:
+        lb = min(zones, key=lambda k: min((q - p).flat() for q in zones[k]))
+        votes.setdefault(team, {}).setdefault(lb, 0)
+        votes[team][lb] += 1
+    out = {}
+    for team, v in votes.items():
+        lb, n = max(v.items(), key=lambda kv: kv[1])
+        if n >= 2 and n * 4 >= 3 * sum(v.values()):
+            out[team] = lb
+    return out if len(out) == 2 and len(set(out.values())) == 2 else {}
+
+
 class Watch:
     """The live Invasion state for tools/live_bots.py: fills the snapshot's inv_ fields every tick and keeps the
     terrain's barriers in step with the gates standing in the game."""
@@ -233,6 +282,7 @@ class Watch:
         s.placed = set()                          # bots spawning where the brain picked (tools/live_bots.py spawn_check):
                                                   # picked by this phase, their spawns cannot tell it
         s.phase, s.attackers, s.sides_set = 1, inv["attackers"], False
+        s.res_label = {}                          # {player team: respawn-zone label}, read from the game's own opening spawns
         s.score_base = "first"                    # (attacking team, its score at the round's start); "first": 0 (a brain
                                                   # started mid-round counts the phases taken so far)
         s.core, s.carrier, s.core_t = None, None, -9.0
@@ -270,13 +320,25 @@ class Watch:
         recent = [(team, pos) for _, team, pos in s.spawns]
         # the sides: from the round's start, where everyone spawns in their side's first zone, then kept for the round
         # (live: defenders' later respawns sometimes land nearer an attackers' zone and flipped the sides every tick)
-        if new_round or (not s.sides_set and len(recent) >= 4):
-            roles = roles_from_spawns(s.inv, [(t, p) for _, t, p in (burst if new_round else s.spawns)],
-                                      1 if new_round else s.phase)
+        if new_round:
+            # Invasion swaps attacking and defending teams every round.
+            # Keep the original map marker coordinates and swap only ownership.
+            s.attackers = 1 - s.attackers
+            s.sides_set = True
+        elif not s.sides_set and len(recent) >= 4:
+            # Identify the attacking player team during the initial round.
+            roles = roles_from_spawns(s.inv, [(t, p) for _, t, p in s.spawns],
+                                      s.phase)
             score = {t: a for t, a in roles.items()}
             att = [t for t, a in score.items() if a]
             if len(att) == 1:
                 s.attackers, s.sides_set = att[0], True
+        # which respawn-zone label (the map's Inv_res_p team) each player team uses: read off where the game itself
+        # respawns it at a round's start, not inferred from who attacks (res_spawn_check prefers this)
+        if new_round:
+            s.res_label = labels_from_spawns(s.inv, [(t, p) for _, t, p in burst]) or s.res_label
+        elif not s.res_label and len(recent) >= 4:
+            s.res_label = labels_from_spawns(s.inv, recent, s.phase)
         attacking = [x for x in recent if x[0] == s.attackers]
         if s.sides_set and len(attacking) >= 3:
             # respawns back the phase up only with a clear majority (they lag: a phase change shows only after deaths)
@@ -335,7 +397,6 @@ class Watch:
         snap.mode = "invasion"
         if (s.phase, s.attackers) != s.__dict__.get("_phase_key"):     # a new phase or round: its clock starts
             s._phase_key, s.phase_since = (s.phase, s.attackers), now
-            phase_link_gates(s.T, s.inv, s.phase, s.inv.get("map"))     # (its man cannons, its lifts' landings)
         snap.inv_phase_t = now - s.phase_since
         snap.inv_phase, snap.inv_attackers = s.phase, s.attackers
         snap.inv_zones = list(s.inv["phases"][3 if s.phase == 3 else s.phase])
@@ -404,6 +465,95 @@ def honor_spawns(map_name):
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps", map_name, "inv_spawns.json")
     d = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
     return (d["named"], d.get("ally", {})) if d.get("named") else None
+
+
+def res_zone_spawn(inv, team, phase, rng, taken=()):
+    """Where a bot of map-team `team` respawns in in-game `phase`: a point at an exact marker XYZ (nothing snapped).
+    Two kinds of marker feed the team's pool for the phase, and when both exist each kind is used equally often:
+      Inv_res_p<phase>                 usable in that phase ONLY (Inv_res_p1 in phase 1, p2 in 2, p3 in 3)
+      Inv_res_zone, spawn sequence S   usable from phase S on: sequence 1 in phases 1-3, sequence 2 in phases 2-3 (never
+                                       phase 1), sequence 3 in phase 3 only
+    Within a kind the pick is random (a point another bot has is skipped while a free one is left); the other team's
+    markers are never used. None where the team has nothing for the phase (the game's own spawn stands)."""
+    phase = max(1, min(3, int(phase)))
+    named = list(inv.get("res_named", {}).get(team, {}).get(phase, []))
+    zones = inv.get("res_zone", {}).get(team, {})
+    hills = [p for seq in range(1, phase + 1) for p in zones.get(seq, [])]
+    kinds = [k for k in (named, hills) if k]
+    if not kinds:
+        return None
+    first = rng.randrange(len(kinds))                 # which kind: an even draw, whatever the point counts
+    for kind in kinds[first:] + kinds[:first]:        # (the other kind if this one's points are all taken)
+        free = [p for p in kind if all((p - q).flat() >= SPAWN_CLEAR for q in taken)]
+        if free:
+            return rng.choice(free)
+    return rng.choice(kinds[first])
+
+
+FORWARD_POWER = 2.0    # attackers: a spawn twice as far from the target as the nearest is picked 1/2**2 = 1/4 as often
+VEHICLE_PULL = 0.5     # a spawn by a free vehicle counts as this fraction of its real distance to the target (more pull)
+VEHICLE_R = FOR_VEHICLE_R   # "by a free vehicle": within this of it (25 u)
+
+
+def spawn_targets(inv, phase, attacking):
+    """What a team's respawn should be near this phase: [Vec].
+    Attackers: the phase's inv_obj_flag first (the core's stand in phase 3, the bomb's stand in a bomb phase), else the
+    phase's inv_objective territories. Defenders: the territories they guard, and the core's stand in phase 3."""
+    phase = max(1, min(3, int(phase)))
+    if phase == 3:
+        return [inv["core"]]
+    if attacking and inv.get("bomb") is not None and phase == (inv.get("bomb_phase") or 2):
+        return [inv["bomb"]]
+    return list(inv["phases"][phase])
+
+
+def free_vehicles(vehicles, errands=()):
+    """The vehicles a bot may be sent to: free, drivable (warthog, scorpion, mongoose ...), not another bot's errand."""
+    from .vehicles import spec
+    return [v for v in vehicles if not v.get("occupied") and v["handle"] not in errands
+            and (spec(v["kind"]) or {}).get("move", "none") != "none"]
+
+
+def res_zone_pick(inv, team, phase, rng, taken=(), attacking=None, vehicles=()):
+    """Where a bot of map-team `team` respawns in `phase`, steered by the objective -> (Vec, vehicle handle or None), or
+    None. The pool is res_zone_spawn's (that phase's Inv_res_p<phase> plus the Inv_res_zone hills of that sequence or
+    earlier; exact XYZ), then:
+      attackers  later spawns are used more often: each point's weight falls with its distance from the target
+                 (spawn_targets), (nearest / its distance) ** FORWARD_POWER - so the nearest is likeliest, none is shut out
+      defenders  the free point nearest the territory they guard (the core's stand in phase 3)
+    Going back a spawn is for vehicles only: a point within VEHICLE_R of a free vehicle (`vehicles`, free_vehicles) counts
+    as VEHICLE_PULL of its distance, and the nearest such vehicle is returned for the bot to go and take.
+    attacking None (no side known): res_zone_spawn's even draw between the two kinds of marker."""
+    targets = spawn_targets(inv, phase, attacking) if attacking is not None else []
+    if not targets:
+        pos = res_zone_spawn(inv, team, phase, rng, taken)
+        return None if pos is None else (pos, None)
+    phase = max(1, min(3, int(phase)))
+    pool = list(inv.get("res_named", {}).get(team, {}).get(phase, []))
+    zones = inv.get("res_zone", {}).get(team, {})
+    pool += [p for seq in range(1, phase + 1) for p in zones.get(seq, [])]
+    if not pool:
+        return None
+    free = [p for p in pool if all((p - q).flat() >= SPAWN_CLEAR for q in taken)] or pool
+    scored = []
+    for p in free:
+        d = min((p - t).flat() for t in targets)
+        ride = min(vehicles, key=lambda v: math.dist((p.x, p.y), v["pos"][:2]), default=None)
+        if ride is not None and math.dist((p.x, p.y), ride["pos"][:2]) <= VEHICLE_R:
+            d, ride = d * VEHICLE_PULL, ride["handle"]
+        else:
+            ride = None
+        scored.append((p, max(d, 1.0), ride))
+    if not attacking:
+        best = min(scored, key=lambda x: x[1])
+        return best[0], best[2]
+    near = min(d for _, d, _ in scored)
+    k = rng.random() * sum((near / d) ** FORWARD_POWER for _, d, _ in scored)
+    for p, d, ride in scored:
+        k -= (near / d) ** FORWARD_POWER
+        if k < 0:
+            return p, ride
+    return scored[-1][0], scored[-1][2]
 
 
 def mate_clear(mate, players, T):

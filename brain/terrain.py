@@ -19,9 +19,6 @@ RAY_MAX = 1000.0  # u: no line of sight longer than this (_ray: its samples grow
 WAIST = 0.30     # a handrail's height over the feet (the waist ray of clearance; drops through a rail: _build_nav)
 RAIL_COST = 25.0  # a drop over a handrail: taken only when nothing else gets there (forbidding it cut off floors)
 LID_COST = 400.0  # a drop into a column whose floor goes on at the ledge's height (_build_nav): beyond any detour
-LIFT_R = 1.0      # u: a gravity lift's column round its base marker: no drop lands in it (_build_nav) ...
-LIFT_DROP = 1.0   # u: ... from more than this over its floor (a step down onto a recessed pad is the way in: Construct's
-                  # small lifts sit 0.44 u under the floor round them)
 RAIL = (0.35, 0.45)  # heights over a ledge's floor where a wall is a handrail (0.25 u wall bins: clear of the step below)
 NAV_CELL = 0.25  # path grid spacing = heightmap cell (the base ramps are 0.83 wide, doors about 1)
 ROAD_COST = 0.4  # a vehicle edge on floor a person drove costs this much of its length: their lines are the roads
@@ -35,6 +32,12 @@ KNEE = 0.30          # an overhang is open here (_low_ceiling); a face from the 
 HEAD_TOP = 0.70      # the top of a standing head: a wall here or at EYE over a floor nobody walked (_low_ceiling)
 WALL_COST = 1.5   # extra path cost to enter a cell touching a wall: a biped is ~0.25 wide, so paths
                   # keep to the middle of doors, ramps and gaps between the roof pillars
+WALL_COST2 = 0.5  # the second ring (a cell touching a cell that touches a wall, ~0.5 u off it): a smaller push, so a
+                  # path rounds a rock or a corner with room to spare instead of grazing it and catching (steering is
+                  # never exact; one cell of clearance was not always enough)
+LEDGE_COST = 0.8  # entering a cell on the lip of a drop (LEDGE_MIN or more): walking, not dropping. Paths ran along cliff
+                  # lips and bots slid off, then had no way back up. A cost, not a wall: narrow walkways stay usable
+LEDGE_MIN = 0.8   # u: a neighbour's floor this far below (or none at all) makes a cell a ledge lip
 # Placed pieces face by face (add_faces): the steepest ground a body walks up, 50 degrees in Halo: Reach (the kit's
 # Spartan and Elite bipeds, ground physics: maximum slope angle and uphill cutoff angle 50); a face steeper than that is a
 # wall, flatter a ramp, flatter than FLAT_NZ a floor
@@ -51,14 +54,11 @@ JUMP_UP_REACH = 1.25   # how far out a ledge you jump up onto may be
 @dataclass(frozen=True)
 class JumpVec(Vec):
     """A waypoint across a jump: run to (sx, sy), jump, land at the point itself. A jump a person
-    made also has his run-up spot (rx, ry): get there first, then run through the take-off. A man cannon's ride has its
-    seconds aloft (air; 0 a jump) and its entrance as the run-up."""
+    made also has his run-up spot (rx, ry): get there first, then run through the take-off."""
     sx: float = 0.0
     sy: float = 0.0
     rx: float = math.nan
     ry: float = math.nan
-    air: float = 0.0
-    crouch: bool = False    # a crouch-jump: crouched in the air (a person did it so, GitHub #20; LiDAR's called ones)
 
 
 @dataclass(frozen=True)
@@ -85,7 +85,7 @@ def walked_under(floors, x0, y0, cell, walked):
     """People's walks ~1 u under a lone floor layer nobody walked on: the walked level wins (in place, on the
     (L, h, w) floors; returns the cells changed). The mesh merges surfaces closer than LAYER_GAP into one level at the
     higher: live Boneyard B27 / B28, a flat -9.0 slab over the -10.0 ground at the stair's foot (254.5-255.5, 54-55.5)
-    held bots standing at -10 on it and sent them up a route into the stair's side (report 161417).
+    held bots standing at -10 on it and sent them up a route into the stair's side (the owner's report 161417).
     Seeds: a walk with no layer within 0.3, the nearest layer UNDER_LO-UNDER_HI over it with no walk on it, and its
     four neighbours the same flat level (a crate's edge cell is not: its other side is the ground); from each, the flat
     patch at that level within UNDER_R. ponytail: one patch height per seed; a sloped phantom stays."""
@@ -256,7 +256,7 @@ def climb_ok(z_from, z_to):
     return -MAX_DROP <= z_to - z_from <= MAX_RISE
 
 
-# --- three kinds of wall (Nov 4: windows let enemies be seen, fences still act as walls but can be shot through):
+# --- three kinds of wall (owner, Nov 4: "windows get enemy info, fences still act as walls but can be shot through"):
 # solid stops walking, sight and shots; a window (glass) walking and shots (unless it breaks), not sight; a fence
 # (grate, chain-link, railing, mesh, bars) walking only. By a level's shader / a Forge piece's face material / a piece's
 # name (tools/lidar_walls.py reads the maps' collision; Terrain.set_wall_kinds)
@@ -348,14 +348,12 @@ def piece_wall_kinds(blocks):
 
 class Terrain:
     lid_rule = True   # drops into a column whose floor goes on at our own height cost LID_COST (_build_nav; tests: off)
-    corner_rule = True   # a diagonal drop between two cells shut at our height costs LID_COST (_build_nav)
 
     def __init__(s, npz_path, bases, extra_floor=(), blocks=(), slit_rule=False, window=None, stair_rule=False,
-                 walked=None, lifts=()):
+                 walked=None):
         # walked: cells people stood on (LiDAR walk keys, maps.terrain people_walked): a low ceiling over floor nobody
-        # walked is no floor (_low_ceiling). lifts: gravity lifts' base markers (x, y, z): no drop into their columns
+        # walked is no floor (_low_ceiling)
         s.walked_cells = walked
-        s.lift_pads = [tuple(p[:3]) for p in lifts]
         # slit_rule: no drops into slits no body fits (_build_nav). Reach only: a crack rule on Halo CE cut real drops
         # (Damnation, Lockdown); Reach's 0.25 u cells on its larger maps checked on Countdown stair_rule: stairs climb
         # STAIR_RISE a cell along their run (_stairs). Halo 4 / H2A levels (Adrift)
@@ -674,6 +672,9 @@ class Terrain:
         s.blocked.add(s._blk_key(b, a))
 
     STUCK_RADIUS, STUCK_COST = 0.35, 400.0   # cost beyond any detour: a wall unless there is no other way
+    STUCK_HALO, STUCK_HALO_COST = 0.8, 6.0   # a soft ring round the disk: an odd-shaped rock is bigger than one cell, and
+                                             # a path that skirts the disk's edge still scrapes the rest of it
+    CORNER_RULE = True   # no diagonal edge past a blocked corner (_build_nav, can_step): the body clips the corner cell
     STUCK_MAX = 300                           # per map: more means something else is wrong; stop learning
     STUCK_VOTES, STUCK_BOTS, STUCK_PER_MATCH = 3, 2, 10   # bot reports: 3 of a spot from 2+ bots; 10 new a match
 
@@ -696,6 +697,14 @@ class Terrain:
             return
         if any(abs(k[0] - p.x) < 0.5 and abs(k[1] - p.y) < 0.5 and abs(k[2] - p.z) < 1 for k in s.stuck):
             return
+        if not sure and who is not None:
+            # a piece the forge reader found no shape for sits right here (forge.missing_near): known-bad data, so the
+            # report needs no vote
+            try:
+                from .forge import missing_near
+                sure = bool(missing_near(p))
+            except Exception:
+                pass
         if not sure:
             vote = (round(p.x * 2), round(p.y * 2), round(p.z))
             if who is None:                      # LiDAR / simulator tools: the second report
@@ -718,6 +727,180 @@ class Terrain:
         s._fields.clear()
         getattr(s, "_jfields", {}).clear()
         getattr(s, "_hfields", {}).clear()
+
+    # Trapped spots (learn_trap) are walls, and permanent, so they are checked, not trusted:
+    TRAP_VERSION = 2
+    TRAP_PER_MATCH = 10            # new marks a match (loading the saved file does not count): a cascade stops here
+    TRAP_AREA_R, TRAP_AREA_MAX = 2.0, 6   # and no more than this many marks within that radius (one rock, not a wall of them)
+    TRAP_STRIKES = 2               # bots seen RUNNING through a marked spot (trap_walk): the mark was wrong, it goes
+    TRAP_PASS_SPEED = 1.0          # u/s: a bot moving this fast inside a mark's disk is not stopped by it (a run is 2.25)
+    TRAP_TTL_DAYS = 21.0           # a mark nobody has confirmed (n == 1: one report) and nothing has touched this long goes
+    TRAP_WARN = 150                # a map with more marks than this prints a warning on load: something is marking too much
+
+    def _trap_meta(s):
+        """{(x, y, z): {"n": reports, "first": t, "last": t, "strikes": n}} of the marks (learn_trap)."""
+        return s.__dict__.setdefault("trapped", {})
+
+    def learn_trap(s, p, meta=None):
+        """A bot was trapped at p (it ran into a wall or a rock, or under an object, and stood pushing): mark the spot as
+        a wall for good, at once, without learn_stuck's votes (3 reports from 2 bots). The paths price it as a wall
+        (BARRIER_COST: round it while any way round exists, through it only when there is none), the look ahead takes no
+        straight line over it (_straight_ok), and save_traps / load_traps keep it for every later match.
+        Checked, not trusted (a wrong wall is as permanent as a right one): TRAP_PER_MATCH new marks a match and
+        TRAP_AREA_MAX in any TRAP_AREA_R (a cascade), spots people walked and the STUCK_MAX cap (learn_stuck) still stand,
+        a report beside an existing mark confirms it (n + 1: a real wall keeps catching bots that come near), and
+        trap_walk drops a mark bots run through. meta: a saved mark's counts (load_traps), not new. True if new."""
+        import time
+        key = (round(p.x, 1), round(p.y, 1), round(p.z, 1))
+        trapped = s._trap_meta()
+        near = next((k for k in trapped if abs(k[0] - p.x) < 0.5 and abs(k[1] - p.y) < 0.5 and abs(k[2] - p.z) < 1), None)
+        if near is not None:
+            if meta is None:
+                trapped[near]["n"] += 1
+                trapped[near]["last"] = time.time()
+            return False
+        if key in s.stuck:
+            if meta is None:
+                return False
+            # a saved mark that came in as an ordinary stuck spot first (maps.py loads nav_learned.json before this):
+            # priced as a wall from here on, with its counts, strikes and expiry
+            graphs = (s.graph_to, getattr(s, "graph_jump_to", None), getattr(s, "graph_h_to", None))
+            s._stuck_cost(key, graphs, sign=-1.0)
+            trapped[key] = dict(meta)
+            s._stuck_cost(key, graphs)
+            s._fields.clear()
+            getattr(s, "_jfields", {}).clear()
+            getattr(s, "_hfields", {}).clear()
+            return True
+        if meta is None:
+            if s.__dict__.get("trap_new", 0) >= s.TRAP_PER_MATCH:
+                return False
+            if sum(1 for k in trapped if (k[0] - p.x) ** 2 + (k[1] - p.y) ** 2 <= s.TRAP_AREA_R ** 2) >= s.TRAP_AREA_MAX:
+                return False
+        now = time.time()
+        trapped[key] = {"n": 1, "first": now, "last": now, "strikes": 0} if meta is None else dict(meta)
+        s.learn_stuck(p, sure=True)            # (after the mark is filed: _stuck_cost reads it to price this one as a wall)
+        if key not in s.stuck:
+            trapped.pop(key, None)
+            return False
+        if meta is None:
+            s.trap_new = s.__dict__.get("trap_new", 0) + 1
+        return True
+
+    def forget_trap(s, key):
+        """Take a mark off for good: its cost off the graphs, out of the stuck set, and out of the file at the next save."""
+        trapped = s._trap_meta()
+        if key not in trapped:
+            return False
+        s._stuck_cost(key, (s.graph_to, getattr(s, "graph_jump_to", None), getattr(s, "graph_h_to", None)), sign=-1.0)
+        trapped.pop(key)                       # (after the cost: _stuck_cost reads the mark to know it priced a wall)
+        s.stuck.discard(key)
+        s.__dict__.setdefault("trap_gone", set()).add(key)
+        s._fields.clear()
+        getattr(s, "_jfields", {}).clear()
+        getattr(s, "_hfields", {}).clear()
+        return True
+
+    def trap_walk(s, p, speed):
+        """A bot stands at p moving `speed` u/s: inside a mark's disk at a run it is not a wall. A strike on that mark
+        (once in 10 s); TRAP_STRIKES of them (counted across matches: they are saved) and it is forgotten. True when a
+        strike was given (save_traps then)."""
+        import time
+        trapped = s.__dict__.get("trapped")
+        if not trapped or speed < s.TRAP_PASS_SPEED:
+            return False
+        r2, now = s.STUCK_RADIUS ** 2, time.time()
+        for key, m in trapped.items():
+            if (key[0] - p.x) ** 2 + (key[1] - p.y) ** 2 <= r2 and abs(key[2] - p.z) < 0.6:
+                if now - m.get("struck", 0.0) < 10.0:
+                    return False
+                m["struck"], m["strikes"] = now, m.get("strikes", 0) + 1
+                if m["strikes"] >= s.TRAP_STRIKES:
+                    s.forget_trap(key)
+                return True
+        return False
+
+    @staticmethod
+    def _read_traps(path):
+        """{key: meta} from a trapped_walls.json: version 2 rows are dicts, version 1 rows are [x, y, z]."""
+        import json
+        import time
+        out = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                rows = json.load(f).get("spots", ())
+        except (OSError, ValueError, TypeError, AttributeError):
+            return out
+        now = time.time()
+        for r in rows:
+            try:
+                x, y, z = (r["x"], r["y"], r["z"]) if isinstance(r, dict) else r[:3]
+                m = r if isinstance(r, dict) else {}
+                out[(round(float(x), 1), round(float(y), 1), round(float(z), 1))] = {
+                    "n": int(m.get("n", 1)), "first": float(m.get("first", now)), "last": float(m.get("last", now)),
+                    "strikes": int(m.get("strikes", 0))}
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+        return out
+
+    def save_traps(s, path):
+        """Write the marks to path (JSON, version 2), merged with what is there already (another match's, another bot's:
+        counts keep the higher, strikes too), less the ones forgotten here and the unconfirmed ones nobody has touched
+        for TRAP_TTL_DAYS."""
+        import json
+        import os
+        import time
+        disk = s._read_traps(path)
+        for k in s.__dict__.get("trap_gone", ()):
+            disk.pop(k, None)
+        for k, m in s.__dict__.get("trapped", {}).items():
+            d = disk.get(k)
+            disk[k] = {"n": max(m["n"], d["n"]) if d else m["n"], "first": min(m["first"], d["first"]) if d else m["first"],
+                       "last": max(m["last"], d["last"]) if d else m["last"],
+                       "strikes": max(m.get("strikes", 0), d["strikes"]) if d else m.get("strikes", 0)}
+        now = time.time()
+        keep = sorted(k for k, m in disk.items() if m["n"] >= 2 or now - m["last"] <= s.TRAP_TTL_DAYS * 86400)[:s.STUCK_MAX]
+        rows = [dict(x=k[0], y=k[1], z=k[2], **disk[k]) for k in keep]
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"version": s.TRAP_VERSION, "spots": rows}, f)
+            os.replace(tmp, path)               # (whole file or none: a match ending mid-write leaves the old one)
+        except OSError:
+            return False
+        return True
+
+    def load_traps(s, path):
+        """Put the saved marks (save_traps) on this terrain as walls, less the expired unconfirmed ones. Returns how many
+        were new; a map over TRAP_WARN marks prints a warning (stderr) and review_traps lists the suspect ones."""
+        import sys
+        import time
+        saved, now, n = s._read_traps(path), time.time(), 0
+        if len(saved) > s.TRAP_WARN:
+            print(f"terrain: {len(saved)} trapped walls saved in {path}: more than {s.TRAP_WARN}, something marks too "
+                  f"much (review_traps)", file=sys.stderr)
+        for k, m in saved.items():
+            if m["n"] < 2 and now - m["last"] > s.TRAP_TTL_DAYS * 86400:
+                continue
+            n += s.learn_trap(Vec(*k), meta=m)
+        return n
+
+    def _stuck_near(s, x, y, z, r):
+        """Is a learned spot within r (flat) of (x, y) at about height z? Indexed by whole units; rebuilt when the set grew."""
+        idx = s.__dict__.get("_stuck_idx")
+        if idx is None or idx[0] != len(s.stuck):
+            grid = {}
+            for k in s.stuck:
+                grid.setdefault((int(k[0] // 1), int(k[1] // 1)), []).append(k)
+            idx = s._stuck_idx = (len(s.stuck), grid)
+        gx, gy = int(x // 1), int(y // 1)
+        for a in (gx - 1, gx, gx + 1):
+            for b in (gy - 1, gy, gy + 1):
+                for k in idx[1].get((a, b), ()):
+                    if (k[0] - x) ** 2 + (k[1] - y) ** 2 <= r * r and abs(k[2] - z) < 0.6:
+                        return True
+        return False
 
     def _node_at(s, x, y, z, tol=1.0):
         """(layer, row, col) of the floor at (x, y) nearest height z within tol, or None."""
@@ -821,7 +1004,7 @@ class Terrain:
 
     def air_levels(s):
         """(low, high): an aircraft's attack-run and travel heights over the ground under it, from the map's own shape
-        (determined automatically by the distance from the ground). Low: over
+        (the owner: "automatically determine low flight height and high fly height by distance from ground"). Low: over
         the knee-to-roof clutter near the ground (the median of how much higher the top surface gets within 3 u of a
         spot, + 1.5 u), so a strafing run clears crates, rocks and rails. High: over the buildings and hills a straight
         trip passes (the median rise within 8 u, + 3 u). Measured over open sky only (cells whose
@@ -891,19 +1074,25 @@ class Terrain:
             c = nxt
         return Vec(c[0] / 2, c[1] / 2, cells[c])
 
-    def _stuck_cost(s, key, graphs):
-        """Make entering the disk around a learned spot (x, y, z) cost STUCK_COST in these graphs."""
+    def _stuck_cost(s, key, graphs, sign=1.0):
+        """Make entering the disk around a learned spot (x, y, z) cost STUCK_COST in these graphs, and the ring round it
+        (out to STUCK_HALO) STUCK_HALO_COST: the way round a rock that is bigger than the disk."""
         x, y, z = key
-        r = int(s.STUCK_RADIUS / NAV_CELL)
         j0, i0 = s._cell(Vec(x, y, z))
-        nodes = [(l * s.nh + j) * s.nw + i
-                 for j in range(max(0, j0 - r), min(s.nh, j0 + r + 1))
-                 for i in range(max(0, i0 - r), min(s.nw, i0 + r + 1)) if (j - j0) ** 2 + (i - i0) ** 2 <= r * r
-                 for l in range(s.L) if np.isfinite(s.lz[l, j, i]) and abs(s.lz[l, j, i] - z) < 0.6]
-        for g in graphs:
-            if g is not None:
-                for n in nodes:                  # graph_to row n = every edge that enters node n
-                    g.data[g.indptr[n]:g.indptr[n + 1]] += s.STUCK_COST
+        # a spot a bot was trapped at (learn_trap) is a wall: BARRIER_COST, taken only when there is no way round at all
+        core = s.BARRIER_COST if tuple(key) in s.__dict__.get("trapped", ()) else s.STUCK_COST
+        rings = ((s.STUCK_RADIUS, core, None), (s.STUCK_HALO, s.STUCK_HALO_COST, s.STUCK_RADIUS))
+        for radius, cost, inner in rings:
+            r, ri2 = int(radius / NAV_CELL), ((int(inner / NAV_CELL)) ** 2 if inner else -1)   # (ri2 -1: no hole)
+            nodes = [(l * s.nh + j) * s.nw + i
+                     for j in range(max(0, j0 - r), min(s.nh, j0 + r + 1))
+                     for i in range(max(0, i0 - r), min(s.nw, i0 + r + 1))
+                     if (j - j0) ** 2 + (i - i0) ** 2 <= r * r and (j - j0) ** 2 + (i - i0) ** 2 > ri2
+                     for l in range(s.L) if np.isfinite(s.lz[l, j, i]) and abs(s.lz[l, j, i] - z) < 0.6]
+            for g in graphs:
+                if g is not None:
+                    for n in nodes:                  # graph_to row n = every edge that enters node n
+                        g.data[g.indptr[n]:g.indptr[n + 1]] += cost * sign
 
     def los(s, a, b, mode=None):
         """Eye of a to chest of b, or else to b's head (a human sees a head over a low wall). Every wall stops it, windows
@@ -931,7 +1120,7 @@ class Terrain:
         that spot lets rounds (and sight) through, a fence the map's data does not name (a grate, a railing). Per
         quarter-unit cell and half-unit height, on the SHOT_VOTES-th hit (separate episodes: Bot.learn_hits), up to
         SHOT_MAX cells; s.walls_learned holds them as fence cells [x4, y4, lo, hi] (maps.save_learned:
-        shots_learned.json, loaded as fences). Returns the cells it learned."""
+        walls_learned.json, loaded as fences). Returns the cells it learned."""
         if s.shot_los(a, b) or not math.isfinite(a.x + a.y + a.z + b.x + b.y + b.z):
             return []
         za, zb = a.z + EYE, b.z + CHEST
@@ -1016,32 +1205,6 @@ class Terrain:
         s.wall_kinds = used
         return used
 
-    def set_open_under(s, areas):
-        """Open air under a lone overhead surface where the exported level has no ground (maps/<map>/sight_open.json,
-        maps._build): areas [{"x": [lo, hi], "y": [lo, hi], "above": z}]; in each box the cells with no floor whose lowest
-        surface is over z have no ground for the sight, shot and crosshair rays (_ray, aim_hit). Walking, falls and
-        aircraft keep s.low. Breakpoint: the thin sloped strip 16-26 u over the gap between the tower ledge and the
-        bridge read as ground, every tower-to-bridge line blocked (the collaborator's fork, 1aa3339: replayed open lines
-        13 -> 46 of 138). Returns the cells opened."""
-        s.ray_low = None
-        if not areas:
-            return 0
-        rl = s.low.copy()
-        xs = s.x0 + (np.arange(s.w) + 0.5) * s.cell
-        ys = s.y0 + (np.arange(s.h) + 0.5) * s.cell
-        nofloor = ~np.isfinite(s.floors).any(axis=0)
-        for a in areas:
-            box = ((ys >= a["y"][0]) & (ys <= a["y"][1]))[:, None] & ((xs >= a["x"][0]) & (xs <= a["x"][1]))[None, :]
-            with np.errstate(invalid="ignore"):
-                rl[box & nofloor & np.isfinite(rl) & (rl > float(a["above"]))] = np.nan
-        opened = int((np.isfinite(s.low) & ~np.isfinite(rl)).sum())
-        s.ray_low = rl if opened else None
-        return opened
-
-    def _ray_low(s):
-        rl = getattr(s, "ray_low", None)
-        return s.low if rl is None else rl
-
     def _ray(s, a, b, part, mode=None):
         """Eye of a to height part of b over the real level: blocked by a steep face (wall bitmask)
         at the ray's height, by the ray crossing a floor level (a slab between storeys), or by the ray
@@ -1067,7 +1230,7 @@ class Terrain:
         t = np.linspace(0.0, 1.0, n)[1:-1]          # skip both end points (the players themselves)
         xs, ys, zs = a.x + dx * t, a.y + dy * t, za + (zb - za) * t
         j, i = s._ij(xs, ys)
-        lows = np.nan_to_num(s._ray_low()[j, i], nan=-1e3)
+        lows = np.nan_to_num(s.low[j, i], nan=-1e3)
         if (zs < lows - 0.05).any():
             return False                             # through the ground
         W = s.walls[j, i]
@@ -1106,7 +1269,7 @@ class Terrain:
             W = W.copy()
             k = min(W.shape[-1], s.see_clear.shape[-1])
             W[:, :k] &= ~s.see_clear[j, i, :k]
-        hit = (zs < np.nan_to_num(s._ray_low()[j, i], nan=-1e3) - 0.05) | s._wall_bit(W, zs)
+        hit = (zs < np.nan_to_num(s.low[j, i], nan=-1e3) - 0.05) | s._wall_bit(W, zs)
         fl = s.floors[:, j, i]
         with np.errstate(invalid="ignore"):
             hit |= (((np.r_[o.z, zs[:-1]] - fl) * (zs - fl) < 0) & np.isfinite(fl)).any(axis=0)
@@ -1140,7 +1303,8 @@ class Terrain:
         idx = np.arange(s.L * N).reshape(s.L, s.nh, s.nw)
         rows, cols, wts = [], [], []
         z = np.nan_to_num(s.lz, nan=1e6)
-        s.near_wall = s._near_wall(step)
+        s.near_wall = s._near_wall(step)              # (also sets s.near_ledge)
+        s.near_wall2 = s._ring2(s.near_wall)
         # a handrail at a ledge: wall at waist height over the upper floor, in its cell or the one below the drop. The
         # chest-and-head wall test lets it through, so paths dropped off walkways right through rails: such a drop
         # costs RAIL_COST more
@@ -1156,17 +1320,6 @@ class Terrain:
         # stairs (stair_rule): their risers step over MAX_RISE, so the nav walled off Adrift's flag decks (live:
         # runners stood under the flag 4-7 u off for minutes, no pull in 178 s)
         stairs = s._stairs() if s.stair_rule else None
-        # a gravity lift's column: a drop into it from over it meets what pushes up (Blood Cavern flag, Nov 6
-        # 16:50, the back lift: bots kept trying to enter its exit end; the route off its top dropped 3 u into its column)
-        in_lift = None
-        if getattr(s, "lift_pads", None):
-            in_lift = np.zeros(s.lz.shape, bool)
-            xs = s.x0 + (np.arange(s.nw) + 0.5) * NAV_CELL
-            ys = s.y0 + (np.arange(s.nh) + 0.5) * NAV_CELL
-            for px, py, pz in s.lift_pads:
-                col = (xs[None, :] - px) ** 2 + (ys[:, None] - py) ** 2 < LIFT_R * LIFT_R
-                with np.errstate(invalid="ignore"):
-                    in_lift |= col[None] & (np.abs(s.lz - pz) < 1.0)
 
         def slit(dst, za, at):
             # tested at the drops only (`at`): over the whole map for every pair of levels it took 79 s of a Forge World
@@ -1192,16 +1345,21 @@ class Terrain:
                     if not both.any():
                         continue
                     za, zb = z[la][a], z[lb][b]
-                    for src, dst, ls, ld, rise in ((a, b, la, lb, zb - za), (b, a, lb, la, za - zb)):
+                    for sgn, (src, dst, ls, ld, rise) in zip((1, -1), ((a, b, la, lb, zb - za), (b, a, lb, la, za - zb))):
                         lim = MAX_RISE if tz is None else np.maximum(MAX_RISE, np.maximum(tz[ls][src], tz[ld][dst]) * dl + 0.02)
                         if stairs is not None:      # along a stair's run (x edges by x stairs, y by y, diagonals by either)
                             st = stairs[0] if not dj else stairs[1] if not di else stairs[0] | stairs[1]
                             lim = np.where(st[ls][src] | st[ld][dst], np.maximum(lim, STAIR_RISE * dl / NAV_CELL), lim)
                         ok = both & (rise <= lim) & (rise >= -MAX_DROP)
+                        if dj and di and s.CORNER_RULE and ok.any():
+                            # no cutting a corner: a diagonal step passes the corner point of the two cells beside it,
+                            # and a body ~a cell wide clips whichever of them is a wall or a rock (bots caught on rock
+                            # corners and door frames pushing at a step the grid called free). Both cells beside it must
+                            # be walkable floor at the step's start or end height; the way round through the open one
+                            # (two straight steps) is still there, so nothing is cut off
+                            ok &= s._corners_clear(ok, src, ls, ld, sgn * dj, sgn * di, z[ls][src], z[ld][dst],
+                                                   lim)
                         drop = ok & (rise < -lim)               # off a ledge (a stair step or a ramp down is not one)
-                        if in_lift is not None:
-                            ok &= ~(drop & in_lift[ld][dst] & (rise < -LIFT_DROP))   # (into a lift's column: thrown up)
-                            drop &= ok
                         over, extra = drop, None
                         if drop.any():
                             if s.slit_rule:
@@ -1209,8 +1367,8 @@ class Terrain:
                             if s.lid_rule:
                                 # the landing column has floor between the landing and our own height: the ledge (a
                                 # bridge, a walkway) goes on over it, so a body walks onto that floor and never falls
-                                # through it (Halo 4 ca_blood_cavern, flagged stuck on a wall: paths dropped 2.6 u off
-                                # the ledge at (-8.1, 6.4) into the floor under it; 75% of 824 s of wall pushes in the
+                                # through it (Halo 4 ca_blood_cavern, the owner's "stuck on this wall": paths dropped 2.6 u off
+                                # the ledge at (-8.1, 6.4) into the floor under it; 75% of 824 s of wall pushes in his
                                 # two games). Priced LID_COST, not cut: at the 0.25 u cells a one-cell slot people drop
                                 # through reads the same (cut, Lockout lost 17-43 walked cells). A floor a little over
                                 # ours there (a rail's or a wall's top) is priced as a rail: a drop over it is a jump
@@ -1223,29 +1381,16 @@ class Terrain:
                                 extra = np.zeros(drop.shape)
                                 extra[jj[rail], ii[rail]] = RAIL_COST
                                 extra[jj[lid], ii[lid]] = LID_COST
-                                if dj and di and s.corner_rule:
-                                    # a diagonal drop between two cells both shut at our height (a wall's or rail's
-                                    # top over our floor, or our floor there walled): the corner no body fits through,
-                                    # priced as a lid (Blood Cavern, playtests Nov 6: from (-8.1, 8.9) and (-4.8,
-                                    # 2.7) routes dropped diagonally past a parapet's ends, survivors pushed 35 s and
-                                    # 1660 rows at them)
-                                    shut = np.ones(len(jj), bool)
-                                    for side in ((src[0].start + jj, dst[1].start + ii), (dst[0].start + jj, src[1].start + ii)):
-                                        sc = s.lz[:, side[0], side[1]]
-                                        with np.errstate(invalid="ignore"):
-                                            top = ((sc > za_ + MAX_RISE) & (sc < za_ + BODY[1])).any(axis=0)
-                                            own = (np.abs(sc - za_) <= MAX_RISE) & ~s.lwalk[:, side[0], side[1]]
-                                        shut &= top | own.any(axis=0)
-                                    extra[jj[shut], ii[shut]] = np.maximum(extra[jj[shut], ii[shut]], LID_COST)
                             drop &= ok
                             jj, ii = np.nonzero(drop)
                             over = np.zeros(drop.shape, bool)
                             over[jj, ii] = rail_here[ls][src][jj, ii] | rail_at(nwalls[dst][jj, ii], z[ls][src][jj, ii])
                         rows.append(idx[ls][src][ok]); cols.append(idx[ld][dst][ok])
+                        walk = rise >= -lim                  # (a step on the level, not a drop: a landing is no lip)
                         wts.append(dl + np.abs(rise[ok]) * 2.0 + WALL_COST * s.near_wall[ld][dst][ok] + RAIL_COST * over[ok]
+                                   + WALL_COST2 * s.near_wall2[ld][dst][ok]
+                                   + LEDGE_COST * (s.near_ledge[ld][dst] & walk)[ok]
                                    + (extra[ok] if extra is not None else 0.0))
-        if not rows:              # no floor at all: an empty Forge canvas before its layout's pieces (H2A's skyboxes, #23)
-            rows, cols, wts = [np.zeros(0, np.int64)], [np.zeros(0, np.int64)], [np.zeros(0)]
         r, c, w = np.concatenate(rows), np.concatenate(cols), np.concatenate(wts)
         s.graph = coo_matrix((w, (r, c)), shape=(s.L * N, s.L * N)).tocsr()
         s.graph_to = s.graph.T.tocsr()   # reversed: Dijkstra from a goal gives every node's cost to it
@@ -1313,12 +1458,45 @@ class Terrain:
                 low[l, j, i] = True
         return low
 
+    def _corners_clear(s, ok, src, ls, ld, sj, si, zs, zd, lim):
+        """For the diagonal edges `ok` (a mask over the source slice `src`), stepping (sj, si) cells: does each of the two
+        cells beside the step (the source's neighbour along j and along i) hold walkable floor at the step's start or end
+        height (within the edge's climb limit)? Returns the mask of edges that do. Tested at the edges that survived
+        only, a million at a time (Forge canvases hold millions of cells)."""
+        jj, ii = np.nonzero(ok)
+        out = np.zeros(ok.shape, bool)
+        rj, ri = jj + src[0].start, ii + src[1].start
+        tol = (lim[jj, ii] if np.ndim(lim) else lim) + 0.03
+        for lo in range(0, len(jj), 1 << 20):
+            sl = slice(lo, lo + (1 << 20))
+            a_, b_, za_, zb_ = rj[sl], ri[sl], zs[jj[sl], ii[sl]], zd[jj[sl], ii[sl]]
+            t_ = tol[sl] if np.ndim(tol) else tol
+            good = np.ones(len(a_), bool)
+            for mj, mi in ((a_ + sj, b_), (a_, b_ + si)):
+                zl = s.lz[:, mj, mi]
+                with np.errstate(invalid="ignore"):
+                    hit = s.lwalk[:, mj, mi] & ((np.abs(zl - za_) <= t_) | (np.abs(zl - zb_) <= t_))
+                good &= hit.any(axis=0)
+            out[jj[sl], ii[sl]] = good
+        return out
+
+    def _ring2(s, near):
+        """The cells that touch a near-wall cell (4-neighbours, same level) and are not one themselves: the second ring."""
+        out = near.copy()
+        out[:, 1:, :] |= near[:, :-1, :]
+        out[:, :-1, :] |= near[:, 1:, :]
+        out[:, :, 1:] |= near[:, :, :-1]
+        out[:, :, :-1] |= near[:, :, 1:]
+        return out & s.lwalk & ~near
+
     def _near_wall(s, step):
         """Per node: does a neighbour cell rise into a wall (no surface you could step onto, and
-        solid above head-ish height)? Drop-offs are not walls."""
+        solid above head-ish height)? Drop-offs are not walls. Also sets s.near_ledge: a neighbour with no floor within
+        LEDGE_MIN under this one (and no wall: the lip of a drop)."""
         top = s.top[::step, ::step]
         pad = lambda a, v: np.pad(a, 1, constant_values=v)
         near = np.zeros(s.lz.shape, bool)
+        ledge = np.zeros(s.lz.shape, bool)
         for l in range(s.L):
             z = s.lz[l]
             for dj in (-1, 0, 1):
@@ -1328,12 +1506,17 @@ class Terrain:
                     sl = (slice(1 + dj, 1 + dj + s.nh), slice(1 + di, 1 + di + s.nw))
                     ntop = pad(top, 1e3)[sl]
                     step_ok = np.zeros_like(near[l])
+                    level = np.zeros_like(near[l])
                     for m in range(s.L):
                         nz = pad(s.lz[m], np.nan)[sl]
                         with np.errstate(invalid="ignore"):
                             step_ok |= (nz - z <= MAX_RISE) & (nz - z >= -MAX_DROP)
+                            level |= (nz - z <= MAX_RISE) & (nz - z >= -LEDGE_MIN)
                     with np.errstate(invalid="ignore"):
-                        near[l] |= ~step_ok & (ntop > z + 0.3)
+                        wall = ~step_ok & (ntop > z + 0.3)
+                        near[l] |= wall
+                        ledge[l] |= ~level & ~(ntop > z + 0.3)
+        s.near_ledge = ledge & s.lwalk
         return near & s.lwalk
 
     def _cell(s, p):
@@ -1473,10 +1656,14 @@ class Terrain:
         ll = None
         oob = getattr(s, "oob", None)                # (set_oob: no shortcut into out of bounds, unless leaving it)
         oob = oob if oob is not None and not oob[start] else None
+        ledge = getattr(s, "near_ledge", None)
         for k in range(1, n + 1):
             t = k / n
-            jj, ii = s._cell(Vec(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t))
+            px, py = a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t
+            jj, ii = s._cell(Vec(px, py))
             ll = s._layer(jj, ii, prev, reach_from=prev, tan=tan)
+            if s.stuck and (jj, ii) != start[1:] and s._stuck_near(px, py, prev, s.STUCK_RADIUS + 0.1):
+                return False      # a spot bots were trapped at: no straight line over it (the path search prices it)
             if ll is None or s.lz[ll, jj, ii] < prev - 0.6:
                 return False      # (no drop off a ledge: the path search knows its rails and slits, Countdown)
             if oob is not None and oob[ll, jj, ii]:
@@ -1484,6 +1671,9 @@ class Terrain:
             if (s.near_wall[ll, jj, ii] and (ground is None or not ground[ll, jj, ii]) and (jj, ii) != start[1:]
                     and (jj, ii) != (j, i)):
                 return False      # a shortcut would scrape a wall: follow the (centred) path instead
+            if (ledge is not None and ledge[ll, jj, ii] and (ground is None or not ground[ll, jj, ii])
+                    and (jj, ii) != start[1:] and (jj, ii) != (j, i)):
+                return False      # ... or run the lip of a drop (the path search priced the lip; a shortcut slides off it)
             prev = s.lz[ll, jj, ii]
             tan = float(s.tz[ll, jj, ii]) if s.tz is not None else 0.0
         return ll == l
@@ -1642,20 +1832,11 @@ class Terrain:
                     wts.append(cost)
                 continue
             w = math.hypot(b.x - a.x, b.y - a.y) * 1.5 + 1.0
-            if b.z - a.z >= 10.0 or (k.get("ride") and math.hypot(b.x - a.x, b.y - a.y) >= 10.0):   # (and one across)
+            if b.z - a.z >= 10.0:
                 # a launch up (a man cannon, a lift): its time aloft at a run's 2.25 u/s, not 1.5 x its flat length
                 # (Spire, live match 230700: the mini base cannon's 24 u flight cost 38 and a bot by its pad walked
                 # on to the middle lift, "just missed man cannon"; the middle lift's 6 s ride cost 5)
                 w = float(k.get("air_s") or math.hypot(b.x - a.x, b.y - a.y) / 3.5) * 2.25 + 1.0
-            run = k.get("runup") if k.get("ride") else None
-            if run:
-                # a man cannon's way in is its entrance, behind it (maps.CANNON_ENTRY): the path search walks bots there,
-                # not to the trigger from the walkways beside its fins. Off this floor: from the trigger, as before
-                rn = s._node(Vec(*run[:3])) if s.inside(run[0], run[1]) else None
-                if rn is not None and rn != dst and s.lwalk[rn] and abs(s.lz[rn] - a.z) < 0.5:
-                    src = rn
-                else:
-                    k = {q: v for q, v in k.items() if q != "runup"}
             ways = [(src, dst, k)]
             if jump_ways(k, s, getattr(s, "jump_apex", 0.8)) == "two-way":
                 ways.append((dst, src, reverse_jump(k)))     # usable back the other way too
@@ -1777,29 +1958,8 @@ class Terrain:
             cross &= (qx - px) * thru[0] + (qy - py) * thru[1] < 0
         return k[cross]
 
-    def set_link_gates(s, closed):
-        """People's links (hjumps indices) closed now: an Invasion phase's man cannon not spawned yet, a lift whose ride
-        goes elsewhere this phase (brain/invasion.py phase_link_gates). Each costs BARRIER_COST, as a closed gate."""
-        closed = frozenset(closed)
-        if closed != getattr(s, "link_gates", frozenset()):
-            s.link_gates = closed
-            s._refresh_barriers()
-
-    def _link_edges(s, g, closed):
-        """Data indices of reversed graph g holding the closed links' edges (row: its landing node, column: its take-off)."""
-        out = []
-        for n in closed:
-            if n >= len(getattr(s, "hjumps", ())):
-                continue
-            f, t, _, _ = s.hjumps[n]
-            src, dst = (f[0] * s.nh + f[1]) * s.nw + f[2], (t[0] * s.nh + t[1]) * s.nw + t[2]
-            lo, hi = g.indptr[dst], g.indptr[dst + 1]
-            out.extend((lo + np.nonzero(g.indices[lo:hi] == src)[0]).tolist())
-        return np.asarray(sorted(set(out)), np.int64)
-
     def _refresh_barriers(s):
         bars = getattr(s, "barriers", {})
-        gates = getattr(s, "link_gates", frozenset())
         for name in ("graph_to", "graph_jump_to", "graph_h_to"):
             g = getattr(s, name, None)
             if g is None:
@@ -1808,8 +1968,6 @@ class Terrain:
             if old is not None and old.size:
                 g.data[old] -= s.BARRIER_COST
             idx = [s._crossing(g, bar) for bar in bars.values() if bar[7]]
-            if gates and name != "graph_to":          # (the walking graph has no people's links)
-                idx.append(s._link_edges(g, gates))
             idx = np.unique(np.concatenate(idx)) if idx else np.zeros(0, np.int64)
             g.data[idx] += s.BARRIER_COST
             g._hb_applied = idx
@@ -1980,11 +2138,6 @@ class Terrain:
         """Does the nav have a way from a to b (b's own floor, or the one beside it a thing on a stand is reached from)?"""
         l, j, i = s._node(a)
         return bool(np.isfinite(s._field(b, jump, human)[l, j, i]))
-
-    def walk_cost(s, a, b):
-        """The nav's walk cost from a to b (its cost field, the one nav walks down), inf with no way."""
-        l, j, i = s._node(a)
-        return float(s._field(b, False, False)[l, j, i])
 
     RISKY_DROP = 8.0     # a person's jump down more than this is costed like a wall for a carrier (safe=True)
 
@@ -2220,14 +2373,13 @@ class Terrain:
             return a                    # at (or a cell off) the end of the vehicle's ground nearest the goal: here it
         return s._center(*far) if far else b   # stops (drive's ground_end: a = its answer, never a short step)
 
-    def nav(s, a, b, lookahead=6, jump=False, human=False, safe=False, no_tele=False, hazards=(), limit=None):
+    def nav(s, a, b, lookahead=6, jump=False, human=False, safe=False, no_tele=False, hazards=()):
         """Next point to walk toward on the way from a to b. jump=True (skilled players) also
         uses jump links, human=True (any bot that jumps) people's jumps: then the answer may be a
         JumpVec (run to its start, jump). safe=True (a carrier): round people's big drops while any other way
         exists (_field). no_tele=True: round the teleporters while any other way exists (ponytail: the straight-line
         lookahead below can still cut a pad's edge; check _straight_ok against s.links if bots clip pads). hazards:
-        ((x, y, z, r), ...) to go round while any other way exists (an enemy trip mine: Kit.hazards, GitHub #9).
-        limit: the field round b only this far (u of path; cheaper on a huge map), the whole field when a is past it."""
+        ((x, y, z, r), ...) to go round while any other way exists (an enemy trip mine: Kit.hazards, GitHub #9)."""
         if not all(math.isfinite(c) for c in (a.x, a.y, a.z, b.x, b.y)):
             return None              # (a NaN place crashed a tick here, Forge: no way from or to nowhere)
         if not math.isfinite(b.z):   # a goal with no floor under it (a point off Halo 2 Ascension's edge, sim:
@@ -2235,44 +2387,25 @@ class Terrain:
         if math.hypot(b.x - a.x, b.y - a.y) < 2.5 and s._straight_ok(a, *s._node(b)):
             return b
         human = (human or jump) and bool(getattr(s, "hjumps", None) or getattr(s, "hroutes", None))
-        cost = s._field(b, jump, human, safe, limit=limit, no_tele=no_tele, hazards=hazards)
+        cost = s._field(b, jump, human, safe, no_tele=no_tele, hazards=hazards)
         l, j, i = s._node(a)
-        if limit is not None and not np.isfinite(cost[l, j, i]):
-            cost = s._field(b, jump, human, safe, no_tele=no_tele, hazards=hazards)   # (a is past the limit)
-        here = np.isfinite(cost[l, j, i])
-        if human:
+        if human and np.isfinite(cost[l, j, i]):
             # a person's jump (or crouch path) is a way in, never a detour: take it only when it is
             # the cheapest way from its start to where THIS bot is going (the path search's best
             # route uses exactly that edge) and its start is not behind us. Before this a bot that
             # passed near a jump took it whenever the landing was a little closer to its goal
-            # ("possessed by a jump it never meant to do"). On a man cannon's pad, past its entrance (cells the
-            # walk graph has no way out of, here False): its ride if it is the best way from its entrance
+            # ("possessed by a jump it never meant to do").
             def way_in(src, dst, w):
                 return (np.isfinite(cost[dst]) and cost[dst] + w <= cost[src] + 1e-3
-                        and (not here or cost[src] <= cost[l, j, i] + 0.5))
-            for src, dst, k, w in s.hjumps if here else [h for h in s.hjumps if h[2].get("ride") and h[2].get("runup")]:
+                        and cost[src] <= cost[l, j, i] + 0.5)
+            for src, dst, k, w in s.hjumps:
                 to = k["take_off"]
                 if safe and to[2] - k["land"][2] > s.RISKY_DROP and cost[l, j, i] < s.BARRIER_COST:
                     continue      # a carrier with another way down does not take a big drop
-                run = k.get("runup") or (math.nan, math.nan)
-                if k.get("ride") and k.get("runup"):
-                    # a man cannon's ride from 0.9 u of its entrance, behind its fins, or in its lane (0.6 u of the line
-                    # on to the trigger and past it: one in it runs on through, flagged Nov 8: bots hopped at the foot
-                    # and walked back out). From 1.6 u of the trigger, bots on the walkways beside Narrows' fins got the
-                    # ride and pushed through a fin at it; at 1.2 u of the entrance one got it at a fin's back corner
-                    lx, ly = to[0] - run[0], to[1] - run[1]
-                    l2 = max(lx * lx + ly * ly, 1e-9)
-                    u = ((a.x - run[0]) * lx + (a.y - run[1]) * ly) / l2
-                    near = (math.hypot(run[0] - a.x, run[1] - a.y) < 0.9
-                            or (0.0 <= u <= 1.0 + 1.0 / math.sqrt(l2)                     # (to 1 u past the trigger)
-                                and math.hypot(a.x - run[0] - u * lx, a.y - run[1] - u * ly) < 0.6))
-                else:
-                    near = math.hypot(to[0] - a.x, to[1] - a.y) < 1.6
-                if near and abs(to[2] - a.z) < 0.8 and way_in(src, dst, w):
-                    air = float(k.get("air_s") or 2.0) if k.get("ride") else 0.0
-                    return JumpVec(k["land"][0], k["land"][1], k["land"][2], to[0], to[1], run[0], run[1], air,
-                                   bool(k.get("crouch")))
-            for src, dst, path, w in getattr(s, "hroutes", ()) if here else ():
+                if math.hypot(to[0] - a.x, to[1] - a.y) < 1.6 and abs(to[2] - a.z) < 0.8 and way_in(src, dst, w):
+                    run = k.get("runup") or (math.nan, math.nan)
+                    return JumpVec(k["land"][0], k["land"][1], k["land"][2], to[0], to[1], run[0], run[1])
+            for src, dst, path, w in getattr(s, "hroutes", ()):
                 p0 = path[0]
                 # (within 1.6 u, as a jump's take-off: at 1.0 a bot at a climb's foot stood 1.03-1.1 u off its run-up
                 # and pushed at the lip beside it 10-12 s a time, live Boneyard 20261105-041255)
@@ -2300,7 +2433,13 @@ class Terrain:
                     if sub.any():
                         ls, js, is_ = np.nonzero(sub)
                         d = (js + j0 - j) ** 2 + (is_ + i0 - i) ** 2
-                        k = int(np.argmin(d))
+                        order = np.argsort(d)
+                        # the nearest spot that has a way is often across the rock we are stuck against: the nearest few
+                        # that a straight walk reaches first, else the nearest
+                        for k in order[:8]:
+                            if s._straight_ok(a, int(ls[k]), int(js[k] + j0), int(is_[k] + i0)):
+                                return s._center(int(ls[k]), int(js[k] + j0), int(is_[k] + i0))
+                        k = int(order[0])
                         return s._center(int(ls[k]), int(js[k] + j0), int(is_[k] + i0))
             return b      # nothing near (off the map): head straight
         if cost[l, j, i] < 1e-6:
@@ -2395,6 +2534,8 @@ class Terrain:
         za = s.lz[la, ja, ia]
         lb = s._layer(jb, ib, za, reach_from=za, tan=float(s.tz[la, ja, ia]) if s.tz is not None else 0.0)
         if lb is not None:
+            if s.CORNER_RULE and ja != jb and ia != ib and not s._corner_open(ja, ia, jb, ib, za, float(s.lz[lb, jb, ib])):
+                return False                               # (a diagonal past a blocked corner: _build_nav drops those edges)
             return trap is None or not trap[lb, jb, ib]    # never into a place no way leads out of (set_spawns)
         # an edge the path graph has into that cell (a stair's riser, STAIR_RISE: _layer climbs MAX_RISE only, so the
         # sim's walkers stood at every stair the nav sent them up; h4_ca_warhouse CTF: 20% of bot time in the unstuck
@@ -2404,6 +2545,50 @@ class Terrain:
         row = s.graph.indices[s.graph.indptr[na]:s.graph.indptr[na + 1]]
         to = row[row % N == jb * s.nw + ib]
         return bool(len(to)) and (trap is None or not trap.ravel()[to].all())
+
+    def _corner_open(s, ja, ia, jb, ib, za, zb, tol=0.46):
+        """Both cells beside a diagonal step (ja, ia) -> (jb, ib) hold walkable floor near the step's start or end height
+        (the movement side of _corners_clear; looser, so movement allows whatever a path does)."""
+        for mj, mi in ((ja, ib), (jb, ia)):
+            if not any(s.lwalk[l, mj, mi] and (abs(float(s.lz[l, mj, mi]) - za) <= tol or abs(float(s.lz[l, mj, mi]) - zb) <= tol)
+                       for l in range(s.L)):
+                return False
+        return True
+
+    def open_step(s, a, goal=None, r=3.0):
+        """A spot to back off to for a bot caught on a ledge, rock or corner (call it when a bot has pushed at the same
+        point without moving: brain/bot.py's unstick): the nearest cell on about its own level with every neighbour
+        walkable, off the wall rings and ledge lips, preferring one the path to `goal` goes on from (finite cost), and
+        straight-line walkable from where it stands. None when there is nothing within r."""
+        l0, j0, i0 = s._node(a)
+        z0 = float(s.lz[l0, j0, i0]) if np.isfinite(s.lz[l0, j0, i0]) else a.z
+        n = int(r / NAV_CELL)
+        cost = None
+        if goal is not None and all(math.isfinite(c) for c in (goal.x, goal.y)):
+            try:
+                cost = s._field(goal if math.isfinite(goal.z) else Vec(goal.x, goal.y, a.z))
+            except Exception:
+                cost = None
+        best = []
+        for j in range(max(1, j0 - n), min(s.nh - 1, j0 + n + 1)):
+            for i in range(max(1, i0 - n), min(s.nw - 1, i0 + n + 1)):
+                d2 = (j - j0) ** 2 + (i - i0) ** 2
+                if d2 > n * n or d2 < 2:
+                    continue
+                for l in range(s.L):
+                    if not s.lwalk[l, j, i] or abs(float(s.lz[l, j, i]) - z0) > 0.4:
+                        continue
+                    if s.near_wall[l, j, i] or s.near_wall2[l, j, i] or s.near_ledge[l, j, i]:
+                        continue
+                    if cost is not None and not np.isfinite(cost[l, j, i]):
+                        continue
+                    if not s.lwalk[l, j - 1:j + 2, i - 1:i + 2].all():
+                        continue
+                    best.append((d2 + (0.0 if cost is None else float(cost[l, j, i]) * 0.02), l, j, i))
+        for _, l, j, i in sorted(best)[:12]:            # the nearest few: first one a straight walk gets to
+            if s._straight_ok(a, l, j, i):
+                return s._center(l, j, i)
+        return s._center(*min(best)[1:]) if best else None
 
     def floor_in_band(s, x, y, zmin=-1e9, zmax=1e9):
         """A floor height near (x, y) (within 3 units) inside [zmin, zmax], preferring floors players
@@ -2445,3 +2630,42 @@ class Terrain:
             if k is not None and d < 0.5 and (l is None or abs(float(s.lz[l, j, i]) - from_z) > 1.0):
                 l = k
         return float(s.lz[l, j, i]) if l is not None else 0.0
+
+
+def review_traps(path, show=True):
+    """List the trapped walls saved in path (Terrain.save_traps), the suspect ones marked: reported once and never
+    confirmed (n 1), struck (a bot ran through it), old and untouched, or one of a cluster (4+ within 2 u: a cascade).
+    Returns {(x, y, z): [reasons]} for the flagged. Delete a row from the file, or prune_traps(path, keys)."""
+    import time
+    rows, now = Terrain._read_traps(path), time.time()
+    flagged = {}
+    for k, m in sorted(rows.items()):
+        why = []
+        if m["n"] < 2:
+            why.append("single report")
+        if m["strikes"]:
+            why.append(f"{m['strikes']} bot(s) ran through it")
+        if now - m["last"] > 7 * 86400:
+            why.append(f"untouched {int((now - m['last']) / 86400)} days")
+        if sum(1 for q in rows if (q[0] - k[0]) ** 2 + (q[1] - k[1]) ** 2 <= 4.0) >= 4:
+            why.append("in a cluster")
+        if why:
+            flagged[k] = why
+        if show:
+            print(f"{k[0]:9.1f} {k[1]:9.1f} {k[2]:7.1f}  n={m['n']:<3} strikes={m['strikes']}  " + ("; ".join(why) or "ok"))
+    if show:
+        print(f"{len(rows)} marks, {len(flagged)} suspect")
+    return flagged
+
+
+def prune_traps(path, keys):
+    """Remove these marks ((x, y, z) as review_traps gives them) from the saved file. Returns how many went."""
+    import json
+    import os
+    rows = Terrain._read_traps(path)
+    gone = [k for k in keys if rows.pop(tuple(k), None) is not None]
+    out = [dict(x=k[0], y=k[1], z=k[2], **m) for k, m in sorted(rows.items())]
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump({"version": Terrain.TRAP_VERSION, "spots": out}, f)
+    os.replace(path + ".tmp", path)
+    return len(gone)

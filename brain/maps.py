@@ -23,10 +23,6 @@ SPOT_KINDS = {"koth_hill": "hills", "oddball_ball": "balls", "terr_object": "ter
               "inf_haven": "havens", "as_bomb": "bombs", "as_goal": "bomb_goals", "stp_flag": "stockpile_flags",
               "stp_goal": "stockpile_goals"}
 H3_TYPES = {"oddball_ball_spawn_point": "oddball_ball", "koth_hill_static": "koth_hill", "territory_static": "terr_object"}
-# a map variant's .mvar file replaces the scenario's labelled places; these the scenario keeps where the file has none of that
-# kind (Stockpile's flags, Assault's bombs and plates, Territories, Headhunter, Infection havens, King, Oddball)
-MVAR_KEEP = ("stp_flag", "stp_goal", "as_bomb", "as_goal", "terr_object", "hh_drop_point", "inf_haven", "koth_hill",
-             "oddball_ball")
 
 
 def load_map(name):
@@ -48,11 +44,7 @@ def load_map(name):
         mo = read_json(mv)              # and vehicles replace the scenario's; the scenario's CTF stands stay where the
         ctf = [f for f in objs["netgame_flags"] if f["type"] in ("ctf - flag", "CTF flag return")]   # file has none
         has = {f["id"] for f in mo["netgame_flags"] if f["type"] == "ctf - flag"} >= {0, 1}
-        # (and any other mode's places the file has none of: Boardwalk's built-in .mvar labels Stockpile's goals and
-        # respawn zones but no stp_flag, and live Stockpile Nov 10 read no flag in 516 s, 0-0)
-        kinds = {f["type"] for f in mo["netgame_flags"]}
-        keep = [f for f in objs["netgame_flags"] if f["type"] in MVAR_KEEP and f["type"] not in kinds]
-        objs = dict(objs, netgame_flags=mo["netgame_flags"] + ([] if has else ctf) + keep, mvar=mo.get("source"),
+        objs = dict(objs, netgame_flags=mo["netgame_flags"] + ([] if has else ctf), mvar=mo.get("source"),
                     **{k: mo[k] for k in ("spawns", "equipment", "vehicles") if mo.get(k)})
     for f in objs["netgame_flags"]:     # Halo 3's names for Reach's (Construct Team Oddball: no ball spots,
         f["type"] = H3_TYPES.get(f["type"], f["type"])    # so the ball was never found and the match ran as Slayer)
@@ -136,9 +128,6 @@ POWER = {"rocket launcher": ("rockets", "weapon", 1.0), "sniper rifle": ("sniper
          "powerup super shield": ("overshield", "powerup", 0.9), "shield-invisibility": ("camo", "powerup", 0.7),
          "powerup invisibility": ("camo", "powerup", 0.7),
          "plasma_cannon": ("fuelrod", "weapon", 0.6),
-         # health packs: health that does not come back by itself (CE, ODST; brain/games.py), taken when hurt
-         "powerup health pack": ("health_pack", "health", 0.0), "health_pack_large": ("health_pack", "health", 0.0),
-         "health_pack_medium": ("health_pack", "health", 0.0), "health_pack_small": ("health_pack", "health", 0.0),
          # Halo 2 (item collection names)
          "rocket_launcher": ("rockets", "weapon", 1.0), "sniper_rifle": ("sniper", "weapon", 0.8),
          "energy_sword": ("sword", "weapon", 0.9), "beam_rifle": ("beam_rifle", "weapon", 0.6),
@@ -208,43 +197,26 @@ def path_rises(zs, h=0.15):
 LAUNCH_SNAP = 5.0    # u: a ride up starting this near a man cannon or gravity lift starts on it
 LAUNCH_RISE = 10.0   # u: a link rising this much is a launch (no jump gets a person 10 u up)
 PAD_TRIGGER = 1.2    # u: a ride people started this near a launch's marker starts at its trigger
-# u: a man cannon is gone into from behind, along its throw: its entrance (the ride's run-up) this far back from the
-# trigger. Narrows' cannons are a 1 u lane between two fins, the far end a drop: bots on the walkways beside the fins
-# steered at the trigger through a fin (flagged Nov 8); people stood 1.4-1.5 u back and walked in
-CANNON_ENTRY = 1.5
-# a climb of LIFT_RISE+ from within LIFT_COLUMN of a gravity lift's base (Bot.lift_near's radius) is the lift's ride, one
-# way, however low: Blood Cavern's back lift rises 2.8 u, read as a jump back down, and the nav sent bots into its top,
-# where it pushes up (flagged Nov 6 16:50: bots kept trying to enter its exit end); Lockout's and Ivory Tower's low
-# lifts the same
-LIFT_RISE, LIFT_COLUMN = 2.0, 2.0
 
 
 def anchor_launches(links, features):
     """People's rides up (a link rising LAUNCH_RISE+) recorded from near a man cannon or gravity lift (features.json
     "launcher" / "lift") start at its trigger, marked a ride: LiDAR set the take-off where the person left the ground, a
     few units off when he jumped onto the pad (live Spire: one 4.1 u off the middle cannon, where three bots circled
-    pressing jump where no cannon was). The trigger is the ride people started
-    nearest the marker, within PAD_TRIGGER of it: the marker itself sits up to 1.2 u into the cannon's body (a player
-    showed the spot one step short of the launch, 0.4 u from such a ride's start and 1.2 u from the marker; a
+    pressing jump; "Do these stupid fucks think the man cannon is there?"). The trigger is the ride people started
+    nearest the marker, within PAD_TRIGGER of it: the marker itself sits up to 1.2 u into the cannon's body ("Right here
+    where im standing, if I go forward it will shoot me up", 0.4 u from such a ride's start and 1.2 u from the marker; a
     bot dithered 2 u off the Elites' cannon). With none that near, the marker. Copies; the rest as they are."""
     pads = [f["pos"] for f in features if f.get("kind") in ("launcher", "lift")]
-    kinds = [f.get("kind") for f in features if f.get("kind") in ("launcher", "lift")]
     if not pads:
         return list(links)
     flat = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
-    cannons = [f["pos"] for f in features if f.get("kind") == "launcher"]
-    # a launch: up LAUNCH_RISE+, or LAUNCH_RISE+ across from a man cannon (Narrows' throw people over the gap level, 28 u
-    # in 4.2 s: costed as a 28 u jump, about the walk, bots walked round and never took it; flagged Nov 8)
-    rides = [k for k in links if k.get("take_off") and k.get("land")
-             and (k["land"][2] - k["take_off"][2] >= LAUNCH_RISE
-                  or (flat(k["land"], k["take_off"]) >= LAUNCH_RISE
-                      and any(flat(p, k["take_off"]) < LAUNCH_SNAP and abs(p[2] - k["take_off"][2]) < 3.0 for p in cannons)))]
+    rides = [k for k in links if k.get("take_off") and k.get("land") and k["land"][2] - k["take_off"][2] >= LAUNCH_RISE]
     trigger = {}
     for i, p in enumerate(pads):
         starts = [k["take_off"] for k in rides if flat(k["take_off"], p) < PAD_TRIGGER and abs(k["take_off"][2] - p[2]) < 3.0]
         trigger[i] = list(min(starts, key=lambda q: flat(q, p))[:3]) if starts else list(p[:3])
     out, ride_ids = [], {id(k) for k in rides}
-    lifts = [f["pos"] for f in features if f.get("kind") == "lift"]
     for k in links:
         to = k.get("take_off")
         if id(k) in ride_ids:
@@ -252,94 +224,7 @@ def anchor_launches(links, features):
             if flat(pads[i], to) < LAUNCH_SNAP and abs(pads[i][2] - to[2]) < 3.0:
                 k = dict(k, take_off=trigger[i] + list(to[3:]), ride=1)
                 k.pop("runup", None)
-                t0, n = k["take_off"], flat(k["land"], k["take_off"])
-                if kinds[i] == "launcher" and n >= 3.0:     # a man cannon: in from behind, its entrance (CANNON_ENTRY)
-                    k["runup"] = [t0[0] - (k["land"][0] - t0[0]) * CANNON_ENTRY / n,
-                                  t0[1] - (k["land"][1] - t0[1]) * CANNON_ENTRY / n, t0[2]]
-        elif (to and k.get("land") and not k.get("ride") and k["land"][2] - to[2] >= LIFT_RISE
-              and any(flat(p, to) < LIFT_COLUMN and abs(p[2] - to[2]) < 3.0 for p in lifts)):
-            k = dict(k, ride=1)             # a low lift's ride: one way (jump_ways), from where it was taken
         out.append(k)
-    # a man cannon nobody has ridden yet takes its twin's ride (the same cannon by name, ridden), turned half round about
-    # the point between them: two-base maps are built that way (Narrows: only the red base's cannon was ridden, so only
-    # red bots ever took one, flagged Nov 8). Terrain keeps it only on floor at both ends. ponytail: a half turn, not a
-    # mirror; a map with its twins mirrored across a line lands the copy off to the side, then dropped by Terrain
-    ridden = lambda p: [k for k in out if k.get("ride") and flat(k["take_off"], p) < LAUNCH_SNAP and abs(k["take_off"][2] - p[2]) < 3.0]
-    named = [f for f in features if f.get("kind") == "launcher"]
-    for f in named:
-        if ridden(f["pos"]):
-            continue
-        twin = next((g for g in named if g is not f and g.get("name") == f.get("name") and ridden(g["pos"])), None)
-        if twin is None:
-            continue
-        p, q = f["pos"], twin["pos"]
-        mx, my, dz = (p[0] + q[0]) / 2, (p[1] + q[1]) / 2, p[2] - q[2]
-        turn = lambda a: [2 * mx - a[0], 2 * my - a[1], a[2] + dz] + list(a[3:])
-        for k in ridden(q):                 # (both ends turned: the marker itself sits in the cannon's body, off the floor)
-            out.append(dict(k, take_off=turn(k["take_off"]), land=turn(k["land"]), ride=1, twin=1, path=None,
-                            **({"runup": turn(k["runup"])} if k.get("runup") else {})))
-    return out
-
-
-CROUCH_OVER = 0.03     # a landing this much past the plain jump's height already needed the feet tucked (crouched).
-                       # Small on purpose: the measured jump speeds are good to 2-4% (apex 4-8%), so some plain jumps
-                       # get marked (Reach's marks sit 0.04-0.08 past its 0.67), which costs nothing (a crouch in the
-                       # air only tucks the feet), while a real crouch-jump left plain is one the bots fall short of
-CROUCH_BAND = 0.35     # ... up to this much past it: a crouch's tuck (0.15-0.225 u, the kits' bipeds) and slack; higher
-                       # was carried by something else (a ramp's run, a lift), not a crouch
-CROUCH_AIR = 0.35      # and aloft at most this past the plain jump's time to its top: one jump onto a ledge at about
-                       # its top (stairs and ramps the tracker reads as air, and hops in a row, take 1.2-1.6 s for the
-                       # same rise in Halo 3: no crouch-jumps)
-
-
-def crouch_jumps(links, game):
-    """People's jumps (Passive LiDAR in every match, LiDAR mapping) that landed higher over their take-off than the
-    game's plain jump lifts the feet (brain/games.plain_jump), by up to a crouch's tuck: only crouching in the air
-    lands those (GitHub #20), so the bots crouch-jump them too. The game says when the person crouched in H2A and
-    Halo 4 only (tools/botctl.py owner_crouch); elsewhere the landing's height shows it. Returns the links, the
-    marked ones as copies ("crouch": 1, "crouch_from": "height"); the saved LiDAR data is not changed."""
-    from .games import plain_jump
-    top, rise_s = plain_jump(game), plain_jump(game, seconds=True)
-    out = []
-    for k in links:
-        if (k.get("human") and not k.get("crouch") and not (k.get("kind") or k.get("ride") or k.get("called")
-                                                           or k.get("painted")) and k.get("take_off") and k.get("land")):
-            rise = k["land"][2] - k["take_off"][2]
-            if top + CROUCH_OVER < rise <= top + CROUCH_BAND and float(k.get("air_s") or 9.0) <= rise_s + CROUCH_AIR:
-                k = dict(k, crouch=1, crouch_from="height")
-        out.append(k)
-    return out
-
-
-TELE_SAME = 1.5        # a person's teleport starting and ending this near a known pair's is that pair (the same way)
-
-
-HOLD_MIN_S = 10.0      # s: a spot people held the objective at least this long (all their matches summed) is one of theirs
-
-
-def people_holds(m, mode):
-    """Where people held the mode's objective (lidar.json "holds", Passive LiDAR: Oddball's ball), summed over the
-    map's data names: [(Vec, seconds)] with HOLD_MIN_S or more, the longest first. The player's Sandtrap Oddball, Nov 11:
-    416 of 580 holding samples in one spot inside the centre structure: under a roof, little exposure, several ways out."""
-    total = {}
-    for nm in data_names(m):
-        f = os.path.join(ROOT, nm, "lidar.json")
-        for k, sec in (read_json(f).get("holds", {}).get(mode, {}) if os.path.exists(f) else {}).items():
-            total[k] = total.get(k, 0.0) + sec
-    out = [(Vec(*(float(v) for v in k.split(","))), sec) for k, sec in total.items() if sec >= HOLD_MIN_S]
-    return sorted(out, key=lambda x: -x[1])
-
-
-def people_teleports(known, seen):
-    """The teleports people went through (lidar.json "teleports", [[from, to, times]], Passive LiDAR) as one-way
-    pairs (Vec, Vec) for the nav (Terrain.add_links), each direction people used and the map's data (known pairs)
-    lacks: a Forge layout's teleporters, ones the map's flags miss, and the way back through a two-way one."""
-    out = []
-    for a, b, _ in seen:
-        a, b = Vec(*a[:3]), Vec(*b[:3])
-        if not any((a - x).flat() < TELE_SAME and abs(a.z - x.z) < 2.0 and (b - y).flat() < TELE_SAME
-                   and abs(b.z - y.z) < 2.0 for x, y in list(known) + out):
-            out.append((a, b))
     return out
 
 
@@ -394,20 +279,6 @@ def air_heights(hist):
     return low, min(max(q(0.75), low + 3.0), 30.0)
 
 
-def read_learned(path, empty=()):
-    """A learned file's data (what bots or people taught the map), or empty when there is none or it is unreadable:
-    a broken one is set aside as .bad, not the match stopped (live Boardwalk Nov 10: a walls_learned.json of two saves
-    stopped the next match loading the map; Valhalla's rides.json Nov 9)."""
-    if not os.path.exists(path):
-        return empty
-    try:
-        return read_json(path, tries=3)
-    except ValueError:
-        os.replace(path, path + ".bad")
-        print(f"maps: {path} unreadable, moved to {os.path.basename(path)}.bad")
-        return empty
-
-
 def rides_layers(names, T, files=None):
     """What people and bots drove and flew on these maps (maps/<name>/rides.json, tools/lidar.py RideWatch), for
     Terrain.add_rides: (drive cells [(x, y, z)], air {"low"|"high": {half-unit cell: floor z}}, heights (strafing,
@@ -419,7 +290,7 @@ def rides_layers(names, T, files=None):
     if T is not None:
         T.people_drive = []                      # (filled below, file by file: called again on every rides save)
     for f in files or [os.path.join(ROOT, nm, "rides.json") for nm in names]:
-        d = read_learned(f, {})
+        d = read_json(f) if os.path.exists(f) else {}
         drive += [tuple(r[:3]) for r in d.get("drive", []) if r[3] >= 1 or r[4] >= 2]
         if T is not None:                         # people's own driving lines: the vehicles' roads (Terrain._build_vnav)
             T.people_drive = getattr(T, "people_drive", []) + [tuple(r[:3]) for r in d.get("drive", []) if r[3] >= 1]
@@ -501,18 +372,18 @@ def _build(m, window):
     paint = pdata.get("layers", {})
     # jumps the player drew on the painter's view (tools/paint.py "jumps"): people's jumps, one way, never
     # filtered
-    painted = [dict(take_off=list(j[:3]), land=list(j[3:6]), kind="jump", painted=1, human=1, found_by="person")
+    painted = [dict(take_off=list(j[:3]), land=list(j[3:6]), kind="jump", painted=1, human=1, found_by="owner")
                for j in pdata.get("jumps", []) if len(j) == 6]
-    # drops the player showed onto something that breaks the fall (maps/<map>/drops.json; Spire's heat vents):
-    # people's too, with a run-up (soft: onto a vent)
+    # drops the player showed onto something that breaks the fall (maps/<map>/drops.json; Spire's heat vents): his
+    # too, with a run-up (soft: onto a vent)
     for nm in names:
         df = os.path.join(ROOT, nm, "drops.json")
-        painted += [dict(k, kind="jump", painted=1, human=1, found_by="person", soft=1)
+        painted += [dict(k, kind="jump", painted=1, human=1, found_by="owner", soft=1)
                     for k in (read_json(df).get("drops", []) if os.path.exists(df) else [])]
     floor = list(floor) + [tuple(c) for c in paint.get("walk", [])]
     from .placed import static_boxes             # placed crates, walls, rocks the level mesh lacks (brain/placed.py); a
     # map variant's are its own pieces (it may have moved or removed the scenario's), kept in its variant.json
-    game = next((g for g in ("reach", "h4", "h2a", "h3") if m["name"].startswith(g + "_")), None)   # (h3: its shut doors)
+    game = next((g for g in ("reach", "h4", "h2a") if m["name"].startswith(g + "_")), None)
     blocks = static_boxes(m["objects"], game) if game and "variant" not in m else []
     if "variant" in m and m.get("live_blocks") is None:
         from .forge import nav_pieces, piece_key
@@ -527,21 +398,16 @@ def _build(m, window):
     walked = people_walked(names, kinds=(1, 3))
     T = Terrain(m["heightmap"], m["bases"], extra_floor=floor, blocks=blocks, slit_rule=m["name"].startswith(SLIT_GAMES),
                 stair_rule=m["name"].startswith(("h4_", "h2a_")),
-                window=window, walked=walked, lifts=[f["pos"] for f in m.get("features", []) if f.get("kind") == "lift"])
+                window=window, walked=walked)
     T.add_links(m["teleporters"])
     if not m["name"].startswith(("h2_", "h3_", "reach_", "odst_", "h2a_", "h4_")):  # jump links, for skilled bots (CE jump physics; ponytail:
         T.build_jumps()                  # Halo 2's jump is not measured yet, so no gap jumps there)
-    data, seen_tele = {}, []
+    data = {}
     for nm in names:                     # jumps people landed (tools/lidar.py), unless bots keep failing them
         lidar = os.path.join(ROOT, nm, "lidar.json")
         d = read_json(lidar) if os.path.exists(lidar) else {}
         for k in ("walk", "cover", "jumps", "links"):
             data.setdefault(k, []).extend(d.get(k, []))
-        seen_tele.extend(d.get("teleports", []))
-    extra = people_teleports(m["teleporters"], seen_tele)   # teleporters people went through that the map's data lacks
-    if extra:
-        m["teleporters"] = list(m["teleporters"]) + extra
-        T.add_links(extra)
     links = []
     if any(data.values()):
         from .terrain import crouch_key  # and floor people walked crouched: every bot crouches there
@@ -551,8 +417,7 @@ def _build(m, window):
             T.cover_spots = np.array(data["cover"], dtype=float)
         jumps = sorted(data.get("jumps", []))       # apexes LiDAR measured on this map
         T.jump_apex = jumps[len(jumps) // 2] if len(jumps) >= 20 else 0.8
-        from .equipment import game_of
-        links = crouch_jumps(usable_links(data.get("links", [])), game_of(m["name"]))
+        links = usable_links(data.get("links", []))
     links = anchor_launches(links + painted, m.get("features", []))
     if links:
         T.add_human_links(links)
@@ -583,11 +448,17 @@ def _build(m, window):
             z.center = snap(c)           # and on ground players reach (Sidewinder's Mid sat in rock)
     T.people_walked = people_walked(names)   # cells anyone stood on: never a learned wall (Terrain.learn_stuck)
     for nm in names:                     # (a built-in map's variant: the base's learned spots too)
-        los = read_learned(os.path.join(ROOT, nm, "los_learned.json"))
-        if los:
-            T.blocked = set(getattr(T, "blocked", set())) | {tuple(k) for k in los}
-        for x, y, z in read_learned(os.path.join(ROOT, nm, "nav_learned.json")):
-            T.learn_stuck(Vec(x, y, z), sure=True)
+        learned = os.path.join(ROOT, nm, "los_learned.json")
+        if os.path.exists(learned):
+            T.blocked = set(getattr(T, "blocked", set())) | {tuple(k) for k in read_json(learned)}
+        learned = os.path.join(ROOT, nm, "nav_learned.json")
+        if os.path.exists(learned):
+            for x, y, z in read_json(learned):
+                T.learn_stuck(Vec(x, y, z), sure=True)
+        traps = os.path.join(ROOT, nm, "trapped_walls.json")      # walls bots were trapped at (Bot.mark_trap): kept with
+        if os.path.exists(traps):                                 # their counts, strikes and expiry (Terrain.load_traps)
+            T.load_traps(traps)
+    T._traps_loaded = True
     kinds = {}                           # windows and fences (tools/lidar_walls.py): walls you see through, fences you
     for nm in names:                     # shoot through too (Terrain.set_wall_kinds, sees, shot_los)
         wk = os.path.join(ROOT, nm, "wall_kinds.json")
@@ -597,10 +468,9 @@ def _build(m, window):
     from .terrain import piece_wall_kinds   # and placed pieces' own (a Forge railing, glass, an energy pane)
     pk = piece_wall_kinds(blocks)
     learned = []                         # and spots rounds went through (Terrain.learn_shot_through): fences
-    # (shots_learned.json since Nov 11: the old walls_learned.json is not read, its spots were learned from hits landing
-    # as a man went round a corner, and the bots saw and shot through those walls: Bot.corner_hit)
     for nm in names:
-        learned += list(read_learned(os.path.join(ROOT, nm, "shots_learned.json")))
+        lf = os.path.join(ROOT, nm, "walls_learned.json")
+        learned += read_json(lf) if os.path.exists(lf) else []
     pk["fence"] += [c[:4] for c in learned if not c[4]]
     pk["fence_floor"] += [c[:4] for c in learned if c[4]]
     if any(pk.values()):
@@ -608,11 +478,6 @@ def _build(m, window):
     if any(kinds.get(k) for k in ("window", "fence", "window_floor", "fence_floor")):
         T.set_wall_kinds(kinds)
     T.walls_learned = [list(c) for c in learned]
-    open_areas = []                      # air under a lone overhead surface over a hole in the export (Breakpoint's tower-
-    for nm in names:                     # to-bridge gap): sight and shot rays only (Terrain.set_open_under)
-        so = os.path.join(ROOT, nm, "sight_open.json")
-        open_areas += read_json(so).get("areas", []) if os.path.exists(so) else []
-    T.set_open_under(open_areas)
     if m.get("shields"):                 # Forge shields (brain/forge.py): sight-line stops and one-way barriers
         from .forge import apply_shields
         apply_shields(T, m["shields"])
@@ -663,6 +528,9 @@ def swap(m):
     T = _TERRAIN.get(m["name"])
     if T is not None:
         new.blocked |= T.blocked
+        for k, mt in getattr(T, "trapped", {}).items():      # trapped walls keep being walls, with their counts
+            new.learn_trap(Vec(*k), meta=mt)
+        new.trap_gone = set(getattr(T, "trap_gone", ()))
         for k in T.stuck - new.stuck:
             new.learn_stuck(Vec(*k), sure=True)
         T.__dict__.clear()
@@ -683,16 +551,14 @@ def save_learned(m):
     if T is None:
         return
     import json
-    for name, data in (("los_learned.json", T.blocked), ("nav_learned.json", T.stuck),
-                       ("shots_learned.json", [tuple(c) for c in getattr(T, "walls_learned", [])])):
-        if data:
-            # (its own temp file, closed before the move: one shared .tmp, left open, held two brains' writes run
-            # together; live Boardwalk Nov 10, walls_learned.json of two saves, the next match died loading the map)
-            path = os.path.join(ROOT, m["name"], name)
-            tmp = f"{path}.{os.getpid()}.tmp"
-            with open(tmp, "w") as f:
-                json.dump(sorted(data), f)
-            os.replace(tmp, path)
+    # trapped walls live in trapped_walls.json (Bot.save_traps), not here: kept in this file they came back as plain
+    # stuck spots, and a spot forgotten (bots ran through it) came back from it
+    for name, data in (("los_learned.json", T.blocked), ("nav_learned.json", T.stuck - set(getattr(T, "trapped", {}))),
+                       ("walls_learned.json", [tuple(c) for c in getattr(T, "walls_learned", [])])):
+        if data or (name == "nav_learned.json" and os.path.exists(os.path.join(ROOT, m["name"], name))):
+            tmp = os.path.join(ROOT, m["name"], name + ".tmp")
+            json.dump(sorted(data), open(tmp, "w"))
+            os.replace(tmp, tmp[:-4])
 
 
 def get_map(name):
